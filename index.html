@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>تسجيل التبرعات</title>
+  <link rel="stylesheet" href="style.css?v=5">
+</head>
+<body>
+  <div class="app-container">
+    <header class="app-header">
+      <img src="./image.jpg" alt="Logo" class="app-logo">
+      <h1>تسجيل التبرعات</h1>
+      <p class="header-sub">محافظة المنوفية</p>
+      <div class="brand-badge">
+        <span class="brand-dot">◆</span>
+        <span class="brand-text-top">تسجيل تبرعات المتطوعين</span>
+        <span class="brand-dot">◆</span>
+      </div>
+    </header>
+
+    <form id="donationForm" class="donation-form">
+      <div class="form-group">
+        <label for="campaign">اسم الحملة</label>
+        <select id="campaign" required></select>
+      </div>
+
+      <div class="form-group">
+        <label for="center">المركز</label>
+        <select id="center" required></select>
+      </div>
+
+      <div class="entries-section">
+        <div class="entries-header">
+          <span class="entries-title">التبرعات</span>
+          <button type="button" class="btn-add-entry" id="addEntryBtn">+ إضافة تبرع</button>
+        </div>
+        <div id="entriesContainer"></div>
+      </div>
+
+      <div class="error-message" id="errorMessage"></div>
+
+      <div class="form-actions">
+        <button type="submit" class="btn-submit" id="submitBtn">
+          <span class="btn-text">تسجيل الكل</span>
+          <span class="btn-loader">جاري الحفظ...</span>
+        </button>
+      </div>
+    </form>
+
+    <div class="success-overlay" id="successOverlay">
+      <div class="success-card">
+        <div class="success-icon">✓</div>
+        <h2>تم التسجيل بنجاح!</h2>
+        <p id="successMessage">تم حفظ جميع التبرعات</p>
+        <button class="btn-new" id="newSubmission">تسجيل جديد</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
