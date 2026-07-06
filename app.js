@@ -1,6 +1,6 @@
 // ====================== الإعدادات ======================
-const WEB_APP_URL =
-  "https://script.google.com/macros/s/AKfycbzwWwnEd7qjYaONlcV7-0cDSq3b6NsMEN6dqAr8RGSqq41RZCs4IoK0-DN40Sxnk00C/exec"; // ضع الرابط الصحيح هنا
+const WEB_APP_URL_GET = "https://script.google.com/macros/s/AKfycbxmzqRPHjrvDYrClik3bn7OBI-saQvO8c4RtSZ6AZfeguTbUV57CPNaRE9rOrlpSMQj/exec"; // رابط شيت 1 (للقراءة)
+const WEB_APP_URL_POST = "https://script.google.com/macros/s/AKfycbxkdIKYLO9TBcR8aCPZZUnTqSQFJs2bqUUcDJ0rqiMLHSZk_lux-JLMryE1khYueEvq/exec"; // رابط شيت 2 (للكتابة)
 
 // ====================== المتغيرات العامة ======================
 let entryCount = 0;
@@ -42,17 +42,29 @@ async function loadAllData() {
 
     refreshAllLists();
     updateSubmitButton();
+
+    // ===== إخفاء شاشة التحميل =====
+    const loadingOverlay = document.getElementById('loadingOverlay');
+    if (loadingOverlay) {
+      loadingOverlay.classList.add('hidden');
+    }
+
   } catch (error) {
     console.error("خطأ في تحميل البيانات:", error);
     showError(
       "فشل تحميل البيانات من Google Sheets. تأكد من اتصالك بالإنترنت وأن Web App منشور بشكل صحيح.",
     );
+
+    const loadingOverlay = document.getElementById('loadingOverlay');
+    if (loadingOverlay) {
+      loadingOverlay.classList.add('hidden');
+    }
   }
 }
 
 async function fetchData(sheet) {
   try {
-    const url = `${WEB_APP_URL}?sheet=${encodeURIComponent(sheet)}`;
+    const url = `${WEB_APP_URL_GET}?sheet=${encodeURIComponent(sheet)}`;
     const response = await fetch(url);
 
     if (!response.ok) {
@@ -111,6 +123,21 @@ function refreshAllLists() {
         option.textContent = code.donorCode || code.name || code;
         donorCodeDatalist.appendChild(option);
       });
+    }
+  });
+}
+
+// ====================== مسح بيانات المتطوعين عند تغيير المركز ======================
+function clearVolunteerData() {
+  document.querySelectorAll(".entry-card").forEach((entry) => {
+    const volunteerNameInput = entry.querySelector(".volunteer-name");
+    const volunteerPhoneInput = entry.querySelector(".volunteer-phone");
+
+    if (volunteerNameInput) {
+      volunteerNameInput.value = "";
+    }
+    if (volunteerPhoneInput) {
+      volunteerPhoneInput.value = "";
     }
   });
 }
@@ -311,7 +338,7 @@ function fileToBase64(file) {
   });
 }
 
-// ====================== إرسال البيانات (بعد التعديل) ======================
+// ====================== إرسال البيانات (إلى شيت 2) ======================
 document.getElementById("donationForm").addEventListener("submit", async (e) => {
   e.preventDefault();
 
@@ -395,14 +422,13 @@ document.getElementById("donationForm").addEventListener("submit", async (e) => 
       });
     }
 
-    // إنشاء URLSearchParams بدلاً من JSON
+    // إرسال إلى شيت 2 (للكتابة)
     const formData = new URLSearchParams();
     formData.append('campaign', data.campaign);
     formData.append('center', data.center);
     formData.append('entries', JSON.stringify(data.entries));
 
-    // إرسال الطلب باستخدام application/x-www-form-urlencoded (لتجنب CORS preflight)
-    const response = await fetch(WEB_APP_URL, {
+    const response = await fetch(WEB_APP_URL_POST, {
       method: "POST",
       headers: {
         "Content-Type": "application/x-www-form-urlencoded",
@@ -465,6 +491,10 @@ document.addEventListener("DOMContentLoaded", () => {
 
   if (center) {
     center.addEventListener("change", function () {
+      // ===== مسح بيانات المتطوعين أولاً =====
+      clearVolunteerData();
+      
+      // ===== ثم تحديث القوائم =====
       refreshAllLists();
       checkCanAddEntry();
     });
