@@ -1,6 +1,6 @@
 // ====================== الإعدادات ======================
 const WEB_APP_URL_GET = "https://script.google.com/macros/s/AKfycbxmzqRPHjrvDYrClik3bn7OBI-saQvO8c4RtSZ6AZfeguTbUV57CPNaRE9rOrlpSMQj/exec"; // رابط شيت 1 (للقراءة)
-const WEB_APP_URL_POST = "https://script.google.com/macros/s/AKfycbxkdIKYLO9TBcR8aCPZZUnTqSQFJs2bqUUcDJ0rqiMLHSZk_lux-JLMryE1khYueEvq/exec"; // رابط شيت 2 (للكتابة)
+const WEB_APP_URL_POST = "https://script.google.com/macros/s/AKfycbzVwUuZ2YSwBFz9C1OTIG4RhbqgWgjhNZP4JQPimiwtXaFi28rbzzSzdXqSat3BO-9X/exec"; // رابط شيت 2 (للكتابة)
 
 // ====================== المتغيرات العامة ======================
 let entryCount = 0;
