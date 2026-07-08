@@ -63,20 +63,53 @@ async function loadAllData() {
 }
 
 async function fetchData(sheet) {
-  try {
-    const url = `${WEB_APP_URL_GET}?sheet=${encodeURIComponent(sheet)}`;
-    const response = await fetch(url);
+  // Fetch with retries and timeout to handle transient network errors
+  const url = `${WEB_APP_URL_GET}?sheet=${encodeURIComponent(sheet)}`;
+  const maxAttempts = 3;
+  const baseDelay = 600; // ms
+  const timeoutMs = 8000; // per-request timeout
 
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
+  const fetchWithTimeout = (resource, ms) => {
+    const controller = new AbortController();
+    const id = setTimeout(() => controller.abort(), ms);
+    return fetch(resource, { signal: controller.signal })
+      .finally(() => clearTimeout(id));
+  };
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const response = await fetchWithTimeout(url, timeoutMs);
+      if (!response.ok) {
+        const msg = `فشل تحميل ${sheet}: HTTP ${response.status}`;
+        console.warn(msg);
+        if (attempt === maxAttempts) {
+          showNotification('error', msg, 7000);
+          throw new Error(msg);
+        }
+        // otherwise retry
+      } else {
+        const data = await response.json();
+        return Array.isArray(data) ? data : [];
+      }
+    } catch (err) {
+      // handle AbortError differently
+      const isAbort = err.name === 'AbortError';
+      console.error(`Attempt ${attempt} failed for ${sheet}:`, err);
+      if (attempt === maxAttempts) {
+        const userMsg = isAbort
+          ? `انتهت مهلة الاتصال عند تحميل ${sheet} (timeout)`
+          : `فشل الاتصال أو حدث خطأ عند تحميل ${sheet}: ${err.message || err}`;
+        try { showNotification('error', userMsg, 8000); } catch (e) { console.error(e); }
+        return [];
+      }
+
+      // exponential backoff before next attempt
+      const delay = baseDelay * Math.pow(2, attempt - 1);
+      await new Promise((r) => setTimeout(r, delay));
+      // continue to next attempt
     }
-
-    const data = await response.json();
-    return Array.isArray(data) ? data : [];
-  } catch (error) {
-    console.error(`خطأ في تحميل ${sheet}:`, error);
-    return [];
   }
+  return [];
 }
 
 function populateSelect(selectId, data) {
@@ -167,13 +200,23 @@ function checkCanAddEntry() {
 }
 
 // ====================== إنشاء بطاقات التبرع ======================
+function isValidOptionValue(inputEl, datalistEl) {
+  if (!inputEl || !datalistEl) return false;
+
+  const typedValue = inputEl.value.trim();
+  if (!typedValue) return false;
+
+  return Array.from(datalistEl.options).some(
+    (option) => option.value.trim() === typedValue,
+  );
+}
+
 function createEntry() {
   const campaign = document.getElementById("campaign");
   const center = document.getElementById("center");
 
   if (!campaign || !center || !campaign.value || !center.value) {
     showError("⚠️ يرجى اختيار اسم الحملة والمركز أولاً قبل إضافة تبرع");
-    alert("⚠️ يرجى اختيار اسم الحملة والمركز أولاً قبل إضافة تبرع");
     return;
   }
 
@@ -269,6 +312,25 @@ function createEntry() {
     });
   }
 
+  const donorCodeInput = entryCard.querySelector(".donor-code");
+  if (donorCodeInput && donorCodeDatalist) {
+    const updateDonorCodeSelection = () => {
+      if (donorCodeInput.value.trim()) {
+        donorCodeInput.setCustomValidity(
+          isValidOptionValue(donorCodeInput, donorCodeDatalist)
+            ? ""
+            : "يرجى اختيار كود الحالة من القائمة المقترحة",
+        );
+      } else {
+        donorCodeInput.setCustomValidity("");
+      }
+    };
+
+    donorCodeInput.addEventListener("input", updateDonorCodeSelection);
+    donorCodeInput.addEventListener("change", updateDonorCodeSelection);
+    donorCodeInput.addEventListener("blur", updateDonorCodeSelection);
+  }
+
   const fileInput = entryCard.querySelector(".receipt-image");
   const uploadText = entryCard.querySelector(".receipt-upload-text");
   fileInput.addEventListener("change", () => {
@@ -281,14 +343,23 @@ function createEntry() {
   const phoneInput = entryCard.querySelector(".volunteer-phone");
   const volunteerDatalist = entryCard.querySelector(".volunteer-list");
 
-  nameInput.addEventListener("input", () => {
+  const updateVolunteerSelection = () => {
     const match = Array.from(volunteerDatalist.options).find(
-      (o) => o.value === nameInput.value,
+      (option) => option.value.trim() === nameInput.value.trim(),
     );
-    if (match && match.dataset.phone) {
-      phoneInput.value = match.dataset.phone;
+
+    if (match) {
+      phoneInput.value = match.dataset.phone || "";
+      nameInput.setCustomValidity("");
+    } else {
+      phoneInput.value = "";
+      nameInput.setCustomValidity("يرجى اختيار اسم المتطوع من القائمة المقترحة");
     }
-  });
+  };
+
+  nameInput.addEventListener("input", updateVolunteerSelection);
+  nameInput.addEventListener("change", updateVolunteerSelection);
+  nameInput.addEventListener("blur", updateVolunteerSelection);
 
   refreshAllLists();
   updateSubmitButton();
@@ -360,8 +431,12 @@ document.getElementById("donationForm").addEventListener("submit", async (e) => 
   let hasMissingFields = false;
 
   entryCards.forEach((entry) => {
+    const volunteerNameInput = entry.querySelector(".volunteer-name");
+    const volunteerDatalist = entry.querySelector(".volunteer-list");
+    const donorCodeInput = entry.querySelector(".donor-code");
+    const donorCodeDatalist = entry.querySelector(".donor-code-list");
     const fields = [
-      entry.querySelector(".volunteer-name"),
+      volunteerNameInput,
       entry.querySelector(".volunteer-phone"),
       entry.querySelector(".receipt-type"),
       entry.querySelector(".intention"),
@@ -379,6 +454,16 @@ document.getElementById("donationForm").addEventListener("submit", async (e) => 
         field.style.borderColor = "";
       }
     });
+
+    if (volunteerNameInput && volunteerDatalist && !isValidOptionValue(volunteerNameInput, volunteerDatalist)) {
+      hasMissingFields = true;
+      volunteerNameInput.style.borderColor = "red";
+    }
+
+    if (donorCodeInput && donorCodeDatalist && donorCodeInput.value.trim() && !isValidOptionValue(donorCodeInput, donorCodeDatalist)) {
+      hasMissingFields = true;
+      donorCodeInput.style.borderColor = "red";
+    }
   });
 
   if (hasMissingFields) {
@@ -464,10 +549,48 @@ document.getElementById("donationForm").addEventListener("submit", async (e) => 
   loader.style.display = "none";
 });
 
+// Global notification / toast helper
+function showNotification(type, message, duration = 4500) {
+  const container = document.getElementById("toastContainer");
+  if (!container) {
+    // fallback
+    console[type === 'error' ? 'error' : 'warn'](message);
+    return;
+  }
+
+  const toast = document.createElement("div");
+  toast.className = `toast toast--${type || 'info'}`;
+
+  const icon = type === 'success' ? '✓' : type === 'error' ? '!' : type === 'warning' ? '!' : 'i';
+  toast.innerHTML = `
+    <div class="toast-icon">${icon}</div>
+    <div class="toast-body">${message}</div>
+    <button class="toast-close" aria-label="Close">×</button>
+  `;
+
+  container.appendChild(toast);
+
+  const hide = () => {
+    toast.style.animation = 'toastOut 0.18s ease forwards';
+    setTimeout(() => {
+      if (toast && toast.parentNode) toast.parentNode.removeChild(toast);
+    }, 200);
+  };
+
+  const closeBtn = toast.querySelector('.toast-close');
+  closeBtn.addEventListener('click', hide);
+
+  setTimeout(hide, duration);
+}
+
+// Backwards-compatible showError using styled warning toast + inline error box
 function showError(message) {
   const errorBox = document.getElementById("errorMessage");
-  errorBox.textContent = message;
-  errorBox.style.display = "block";
+  if (errorBox) {
+    errorBox.textContent = message;
+    errorBox.style.display = "block";
+  }
+  showNotification('warning', message, 5000);
 }
 
 // ====================== إعادة التحميل ======================
