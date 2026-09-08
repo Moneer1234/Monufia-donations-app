@@ -10,6 +10,11 @@ let allIntentions = [];
 let allCampaigns = [];
 let allCenters = [];
 let allDonorCodes = [];
+let isSubmitting = false;
+
+const MAX_IMAGE_SIZE_BYTES = 1.5 * 1024 * 1024; // 1.5 MB
+const POST_TIMEOUT_MS = 25000;
+const MAX_SUBMIT_ATTEMPTS = 2;
 
 // ====================== تحميل البيانات ======================
 async function loadAllData() {
@@ -402,11 +407,102 @@ function updateSubmitButton() {
 // ====================== تحويل الصورة إلى Base64 ======================
 function fileToBase64(file) {
   return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result.split(",")[1]);
-    reader.onerror = reject;
-    reader.readAsDataURL(file);
+    if (!file) {
+      resolve(null);
+      return;
+    }
+
+    if (file.size > MAX_IMAGE_SIZE_BYTES) {
+      reject(new Error("حجم صورة الإيصال كبير جدًا. يرجى اختيار صورة أصغر من 1.5 ميجا بايت."));
+      return;
+    }
+
+    const img = new Image();
+    const objectUrl = URL.createObjectURL(file);
+
+    img.onload = () => {
+      try {
+        const maxWidth = 1200;
+        const maxHeight = 1200;
+        const scale = Math.min(1, maxWidth / img.width, maxHeight / img.height);
+        const canvas = document.createElement("canvas");
+        const ctx = canvas.getContext("2d");
+
+        canvas.width = Math.max(1, Math.round(img.width * scale));
+        canvas.height = Math.max(1, Math.round(img.height * scale));
+
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+
+        const mimeType = file.type && file.type.includes("png") ? "image/png" : "image/jpeg";
+        const quality = file.size > 600 * 1024 ? 0.75 : 0.9;
+        const dataUrl = canvas.toDataURL(mimeType, quality);
+
+        URL.revokeObjectURL(objectUrl);
+        resolve(dataUrl.split(",")[1]);
+      } catch (error) {
+        URL.revokeObjectURL(objectUrl);
+        reject(error);
+      }
+    };
+
+    img.onerror = () => {
+      URL.revokeObjectURL(objectUrl);
+      reject(new Error("تعذّر قراءة صورة الإيصال."));
+    };
+
+    img.src = objectUrl;
   });
+}
+
+async function sendDonationPayload(payload) {
+  const formData = new URLSearchParams();
+  formData.append("campaign", payload.campaign);
+  formData.append("center", payload.center);
+  formData.append("entries", JSON.stringify(payload.entries));
+
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= MAX_SUBMIT_ATTEMPTS; attempt++) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), POST_TIMEOUT_MS);
+
+    try {
+      const response = await fetch(WEB_APP_URL_POST, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+        },
+        body: formData.toString(),
+        signal: controller.signal,
+      });
+
+      const responseText = await response.text();
+      let responseData;
+      try {
+        responseData = JSON.parse(responseText);
+      } catch {
+        responseData = { success: false, error: responseText || "استجابة غير صحيحة من الخادم" };
+      }
+
+      if (response.ok && responseData && responseData.success) {
+        return responseData;
+      }
+
+      throw new Error((responseData && responseData.error) || `HTTP ${response.status}`);
+    } catch (error) {
+      lastError = error;
+      console.warn(`محاولة إرسال ${attempt}/${MAX_SUBMIT_ATTEMPTS} فشلت:`, error);
+
+      if (attempt < MAX_SUBMIT_ATTEMPTS) {
+        await new Promise((resolve) => setTimeout(resolve, 800 * attempt));
+      }
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  }
+
+  throw lastError || new Error("فشل إرسال البيانات بعد عدة محاولات");
 }
 
 // ====================== إرسال البيانات (إلى شيت 2) ======================
@@ -417,6 +513,12 @@ document.getElementById("donationForm").addEventListener("submit", async (e) => 
   const btn = document.getElementById("submitBtn");
   const loader = btn.querySelector(".btn-loader");
   const text = btn.querySelector(".btn-text");
+  const addEntryBtn = document.getElementById("addEntryBtn");
+  const form = document.getElementById("donationForm");
+
+  if (isSubmitting) {
+    return;
+  }
 
   // التحقق من الحقول الأساسية
   const campaign = document.getElementById("campaign").value;
@@ -475,10 +577,21 @@ document.getElementById("donationForm").addEventListener("submit", async (e) => 
   errorBox.style.display = "none";
 
   // تفعيل حالة التحميل
+  isSubmitting = true;
   btn.disabled = true;
   btn.setAttribute("aria-busy", "true");
   text.style.display = "none";
   loader.style.display = "inline-block";
+
+  if (addEntryBtn) {
+    addEntryBtn.disabled = true;
+    addEntryBtn.style.opacity = "0.6";
+    addEntryBtn.style.cursor = "not-allowed";
+  }
+
+  if (form) {
+    form.classList.add("is-submitting");
+  }
 
   try {
     // تجميع البيانات
@@ -490,7 +603,14 @@ document.getElementById("donationForm").addEventListener("submit", async (e) => 
 
     for (const entry of entryCards) {
       const file = entry.querySelector(".receipt-image").files[0];
-      const base64 = file ? await fileToBase64(file) : null;
+      let base64 = null;
+
+      try {
+        base64 = file ? await fileToBase64(file) : null;
+      } catch (fileError) {
+        console.error("خطأ في صورة الإيصال:", fileError);
+        throw new Error(fileError.message || "حدث خطأ في صورة الإيصال");
+      }
 
       data.entries.push({
         volunteerName: entry.querySelector(".volunteer-name").value,
@@ -507,27 +627,7 @@ document.getElementById("donationForm").addEventListener("submit", async (e) => 
       });
     }
 
-    // إرسال إلى شيت 2 (للكتابة)
-    const formData = new URLSearchParams();
-    formData.append('campaign', data.campaign);
-    formData.append('center', data.center);
-    formData.append('entries', JSON.stringify(data.entries));
-
-    const response = await fetch(WEB_APP_URL_POST, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-      },
-      body: formData,
-    });
-
-    const responseText = await response.text();
-    let responseData;
-    try {
-      responseData = JSON.parse(responseText);
-    } catch {
-      responseData = { success: false, error: responseText };
-    }
+    const responseData = await sendDonationPayload(data);
 
     if (responseData && responseData.success) {
       document.getElementById("successOverlay").style.display = "flex";
@@ -537,16 +637,28 @@ document.getElementById("donationForm").addEventListener("submit", async (e) => 
     }
   } catch (error) {
     console.error("خطأ:", error);
+    const detail = error && error.message ? ` ${error.message}` : "";
     showError(
-      "تعذر الاتصال بـ Apps Script. تأكد من اتصالك بالإنترنت وأن Web App منشور بشكل صحيح.",
+      `تعذر إرسال البيانات${detail}. حاول تقليل حجم الصورة أو إعادة المحاولة بعد قليل.`,
     );
   }
 
   // إعادة تعيين حالة الزر
+  isSubmitting = false;
   btn.disabled = false;
   btn.removeAttribute("aria-busy");
   text.style.display = "inline";
   loader.style.display = "none";
+
+  if (addEntryBtn) {
+    addEntryBtn.disabled = false;
+    addEntryBtn.style.opacity = "1";
+    addEntryBtn.style.cursor = "pointer";
+  }
+
+  if (form) {
+    form.classList.remove("is-submitting");
+  }
 });
 
 // Global notification / toast helper
