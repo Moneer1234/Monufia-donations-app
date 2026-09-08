@@ -13,8 +13,7 @@ let allDonorCodes = [];
 let isSubmitting = false;
 
 const MAX_IMAGE_SIZE_BYTES = 1.5 * 1024 * 1024; // 1.5 MB
-const POST_TIMEOUT_MS = 25000;
-const MAX_SUBMIT_ATTEMPTS = 2;
+const POST_TIMEOUT_MS = 60000;
 
 // ====================== تحميل البيانات ======================
 async function loadAllData() {
@@ -478,48 +477,54 @@ async function sendDonationPayload(payload) {
   formData.append("center", payload.center);
   formData.append("entries", JSON.stringify(payload.entries));
 
-  let lastError = null;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), POST_TIMEOUT_MS);
 
-  for (let attempt = 1; attempt <= MAX_SUBMIT_ATTEMPTS; attempt++) {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), POST_TIMEOUT_MS);
+  try {
+    const response = await fetch(WEB_APP_URL_POST, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+      },
+      body: formData.toString(),
+      signal: controller.signal,
+    });
 
+    const responseText = await response.text();
+    let responseData;
     try {
-      const response = await fetch(WEB_APP_URL_POST, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
-        },
-        body: formData.toString(),
-        signal: controller.signal,
-      });
-
-      const responseText = await response.text();
-      let responseData;
-      try {
-        responseData = JSON.parse(responseText);
-      } catch {
-        responseData = { success: false, error: responseText || "استجابة غير صحيحة من الخادم" };
-      }
-
-      if (response.ok && responseData && responseData.success) {
-        return responseData;
-      }
-
-      throw new Error((responseData && responseData.error) || `HTTP ${response.status}`);
-    } catch (error) {
-      lastError = error;
-      console.warn(`محاولة إرسال ${attempt}/${MAX_SUBMIT_ATTEMPTS} فشلت:`, error);
-
-      if (attempt < MAX_SUBMIT_ATTEMPTS) {
-        await new Promise((resolve) => setTimeout(resolve, 800 * attempt));
-      }
-    } finally {
-      clearTimeout(timeoutId);
+      responseData = JSON.parse(responseText);
+    } catch {
+      responseData = null;
     }
-  }
 
-  throw lastError || new Error("فشل إرسال البيانات بعد عدة محاولات");
+    const normalizedResponseText = responseText.trim().toLowerCase();
+    const isSuccessful = response.ok && (
+      normalizedResponseText === "success" ||
+      (responseData && (
+        responseData.success === true ||
+        responseData.success === "true" ||
+        String(responseData.status || "").toLowerCase() === "success"
+      ))
+    );
+
+    if (isSuccessful) {
+      // وحّد شكل الرد حتى لا تعتبر الواجهة رد "success" النصّي فشلًا.
+      return responseData && typeof responseData === "object"
+        ? { ...responseData, success: true }
+        : { success: true };
+    }
+
+    const errorMessage = responseData && (responseData.error || responseData.message);
+    throw new Error(errorMessage || `HTTP ${response.status}: ${responseText.slice(0, 200)}`);
+  } catch (error) {
+    if (error.name === "AbortError") {
+      throw new Error("انتهت مهلة الاتصال. قد يكون الطلب قيد الحفظ، لذلك لا تعاود الإرسال قبل مراجعة الشيت.");
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeoutId);
+  }
 }
 
 // ====================== إرسال البيانات (إلى شيت 2) ======================
@@ -646,7 +651,7 @@ document.getElementById("donationForm").addEventListener("submit", async (e) => 
 
     const responseData = await sendDonationPayload(data);
 
-    if (responseData && responseData.success) {
+    if (responseData && responseData.success === true) {
       document.getElementById("successOverlay").style.display = "flex";
     } else {
       const msg = (responseData && responseData.error) || "حدث خطأ أثناء الحفظ";
