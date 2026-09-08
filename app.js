@@ -291,7 +291,7 @@ function createEntry() {
             <div class="form-group receipt-upload-group">
                 <label>صورة الإيصال</label>
                 <label class="receipt-upload-box">
-                    <input type="file" class="receipt-image" accept="image/*" required>
+                  <input type="file" class="receipt-image" accept=".jpg,.jpeg,.png,image/jpeg,image/png" required>
                     <span class="receipt-upload-text">اختر صورة</span>
                 </label>
             </div>
@@ -412,55 +412,63 @@ function fileToBase64(file) {
       return;
     }
 
-    const img = new Image();
-    const objectUrl = URL.createObjectURL(file);
+    if (!file.type || !file.type.startsWith("image/")) {
+      reject(new Error("الملف المختار ليس صورة مدعومة. اختر صورة JPG أو PNG."));
+      return;
+    }
 
-    img.onload = () => {
+    const img = new Image();
+    const reader = new FileReader();
+
+    const finish = (dataUrl, width, height) => {
       try {
         const maxWidth = 1200;
         const maxHeight = 1200;
-        const scale = Math.min(1, maxWidth / img.width, maxHeight / img.height);
+        const scale = Math.min(1, maxWidth / width, maxHeight / height);
         const canvas = document.createElement("canvas");
         const ctx = canvas.getContext("2d");
 
-        canvas.width = Math.max(1, Math.round(img.width * scale));
-        canvas.height = Math.max(1, Math.round(img.height * scale));
+        canvas.width = Math.max(1, Math.round(width * scale));
+        canvas.height = Math.max(1, Math.round(height * scale));
 
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
         ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
 
-        // نحول الصورة إلى JPEG ونخفض الجودة تدريجيًا حتى تصبح ضمن الحد المسموح.
         const mimeType = "image/jpeg";
         let quality = 0.85;
-        let dataUrl = canvas.toDataURL(mimeType, quality);
+        let compressedDataUrl = canvas.toDataURL(mimeType, quality);
 
-        while (dataUrl.length * 0.75 > MAX_IMAGE_SIZE_BYTES && quality > 0.35) {
+        while (compressedDataUrl.length * 0.75 > MAX_IMAGE_SIZE_BYTES && quality > 0.35) {
           quality -= 0.1;
-          dataUrl = canvas.toDataURL(mimeType, quality);
+          compressedDataUrl = canvas.toDataURL(mimeType, quality);
         }
 
-        if (dataUrl.length * 0.75 > MAX_IMAGE_SIZE_BYTES) {
+        if (compressedDataUrl.length * 0.75 > MAX_IMAGE_SIZE_BYTES) {
           throw new Error("تعذر ضغط صورة الإيصال إلى أقل من 1.5 ميجا بايت.");
         }
 
-        URL.revokeObjectURL(objectUrl);
         resolve({
-          base64: dataUrl.split(",")[1],
+          base64: compressedDataUrl.split(",")[1],
           mimeType,
           fileName: `${file.name.replace(/\.[^/.]+$/, "")}.jpg`,
         });
       } catch (error) {
-        URL.revokeObjectURL(objectUrl);
         reject(error);
       }
     };
 
-    img.onerror = () => {
-      URL.revokeObjectURL(objectUrl);
-      reject(new Error("تعذّر قراءة صورة الإيصال."));
+    img.onload = () => {
+      finish(reader.result, img.width, img.height);
     };
 
-    img.src = objectUrl;
+    img.onerror = () => {
+      reject(new Error("تعذّر قراءة الصورة. اختر صورة JPG أو PNG من معرض الهاتف."));
+    };
+
+    reader.onerror = () => reject(new Error("تعذّر قراءة ملف الصورة من الجهاز."));
+    reader.onload = () => {
+      img.src = reader.result;
+    };
+    reader.readAsDataURL(file);
   });
 }
 
