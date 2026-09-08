@@ -412,11 +412,6 @@ function fileToBase64(file) {
       return;
     }
 
-    if (file.size > MAX_IMAGE_SIZE_BYTES) {
-      reject(new Error("حجم صورة الإيصال كبير جدًا. يرجى اختيار صورة أصغر من 1.5 ميجا بايت."));
-      return;
-    }
-
     const img = new Image();
     const objectUrl = URL.createObjectURL(file);
 
@@ -434,12 +429,26 @@ function fileToBase64(file) {
         ctx.clearRect(0, 0, canvas.width, canvas.height);
         ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
 
-        const mimeType = file.type && file.type.includes("png") ? "image/png" : "image/jpeg";
-        const quality = file.size > 600 * 1024 ? 0.75 : 0.9;
-        const dataUrl = canvas.toDataURL(mimeType, quality);
+        // نحول الصورة إلى JPEG ونخفض الجودة تدريجيًا حتى تصبح ضمن الحد المسموح.
+        const mimeType = "image/jpeg";
+        let quality = 0.85;
+        let dataUrl = canvas.toDataURL(mimeType, quality);
+
+        while (dataUrl.length * 0.75 > MAX_IMAGE_SIZE_BYTES && quality > 0.35) {
+          quality -= 0.1;
+          dataUrl = canvas.toDataURL(mimeType, quality);
+        }
+
+        if (dataUrl.length * 0.75 > MAX_IMAGE_SIZE_BYTES) {
+          throw new Error("تعذر ضغط صورة الإيصال إلى أقل من 1.5 ميجا بايت.");
+        }
 
         URL.revokeObjectURL(objectUrl);
-        resolve(dataUrl.split(",")[1]);
+        resolve({
+          base64: dataUrl.split(",")[1],
+          mimeType,
+          fileName: `${file.name.replace(/\.[^/.]+$/, "")}.jpg`,
+        });
       } catch (error) {
         URL.revokeObjectURL(objectUrl);
         reject(error);
@@ -603,10 +612,10 @@ document.getElementById("donationForm").addEventListener("submit", async (e) => 
 
     for (const entry of entryCards) {
       const file = entry.querySelector(".receipt-image").files[0];
-      let base64 = null;
+      let compressedImage = null;
 
       try {
-        base64 = file ? await fileToBase64(file) : null;
+        compressedImage = file ? await fileToBase64(file) : null;
       } catch (fileError) {
         console.error("خطأ في صورة الإيصال:", fileError);
         throw new Error(fileError.message || "حدث خطأ في صورة الإيصال");
@@ -621,9 +630,9 @@ document.getElementById("donationForm").addEventListener("submit", async (e) => 
         refNumber: entry.querySelector(".ref-number").value,
         date: entry.querySelector(".entry-date").value,
         donorCode: entry.querySelector(".donor-code").value || "",
-        receiptImageBase64: base64,
-        receiptImageName: file ? file.name : "",
-        receiptImageType: file ? file.type : "",
+        receiptImageBase64: compressedImage ? compressedImage.base64 : null,
+        receiptImageName: compressedImage ? compressedImage.fileName : "",
+        receiptImageType: compressedImage ? compressedImage.mimeType : "",
       });
     }
 
