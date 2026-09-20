@@ -635,7 +635,7 @@ function clearFieldError(field) {
   if (field) field.classList.remove("field-error");
 }
 
-const EGYPT_PHONE_RE = /^01[0125][0-9]{8}$/;
+const EGYPT_PHONE_RE = /^0?\d{10}$/;
 
 function validateEntry(entryCard, seenRefs) {
   const errors = [];
@@ -661,7 +661,7 @@ function validateEntry(entryCard, seenRefs) {
 
   if (!EGYPT_PHONE_RE.test(phone.value.trim())) {
     markFieldError(phone);
-    errors.push("رقم الهاتف غير صحيح (11 رقم يبدأ بـ 010/011/012/015)");
+    errors.push("رقم الهاتف غير صحيح (10 أو 11 رقم، ويمكن أن يبدأ بصفر أو بدون صفر)");
   }
 
   if (!receiptType.value) { markFieldError(receiptType); errors.push("اختر نوع الوصل"); }
