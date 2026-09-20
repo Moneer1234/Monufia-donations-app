@@ -1,6 +1,26 @@
+/* ============================================================
+   تسجيل التبرعات - نسخة مُحسّنة
+   التركيز: ضغط صورة الإيصال + إرسال آمن وغير مكرر
+   ============================================================ */
+
 // ====================== الإعدادات ======================
-const WEB_APP_URL_GET = "https://script.google.com/macros/s/AKfycbxmzqRPHjrvDYrClik3bn7OBI-saQvO8c4RtSZ6AZfeguTbUV57CPNaRE9rOrlpSMQj/exec"; // رابط شيت 1 (للقراءة)
-const WEB_APP_URL_POST = "https://script.google.com/macros/s/AKfycbzVwUuZ2YSwBFz9C1OTIG4RhbqgWgjhNZP4JQPimiwtXaFi28rbzzSzdXqSat3BO-9X/exec"; // رابط شيت 2 (للكتابة)
+const WEB_APP_URL_GET = "https://script.google.com/macros/s/AKfycbxmzqRPHjrvDYrClik3bn7OBI-saQvO8c4RtSZ6AZfeguTbUV57CPNaRE9rOrlpSMQj/exec";
+const WEB_APP_URL_POST = "https://script.google.com/macros/s/AKfycbzVwUuZ2YSwBFz9C1OTIG4RhbqgWgjhNZP4JQPimiwtXaFi28rbzzSzdXqSat3BO-9X/exec";
+
+// حدود الصور
+const RAW_FILE_MAX_BYTES = 25 * 1024 * 1024; // أقصى حجم ملف خام مقبول قبل الضغط
+const IMAGE_TARGET_BYTES = 500 * 1024;       // الحجم المستهدف بعد الضغط (500KB)
+const IMAGE_MAX_DIM = 1600;                  // أقصى بُعد (عرض/ارتفاع) بالبكسل
+const JPEG_START_QUALITY = 0.82;
+const JPEG_MIN_QUALITY = 0.40;
+
+// الشبكة
+const POST_TIMEOUT_MS = 90000;
+const GET_TIMEOUT_MS = 10000;
+const GET_MAX_ATTEMPTS = 3;
+
+// أنواع الصور المدعومة
+const SUPPORTED_IMAGE_TYPES = ["image/jpeg", "image/jpg", "image/png", "image/webp"];
 
 // ====================== المتغيرات العامة ======================
 let entryCount = 0;
@@ -11,28 +31,247 @@ let allCampaigns = [];
 let allCenters = [];
 let allDonorCodes = [];
 let isSubmitting = false;
+let pendingCompressions = 0;
 
-const MAX_IMAGE_SIZE_BYTES = 1.5 * 1024 * 1024; // 1.5 MB
-const POST_TIMEOUT_MS = 60000;
+// ============================================================
+//  أدوات مساعدة
+// ============================================================
 
-// ====================== تحميل البيانات ======================
-async function loadAllData() {
+function uuid() {
+  if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
+  return "id-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10);
+}
+
+function formatBytes(bytes) {
+  if (bytes < 1024) return bytes + " B";
+  if (bytes < 1024 * 1024) return Math.round(bytes / 1024) + " KB";
+  return (bytes / (1024 * 1024)).toFixed(2) + " MB";
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+// ============================================================
+//  ضغط صورة الإيصال  ← الجزء الأهم
+// ============================================================
+
+/**
+ * تحميل الصورة كـ ImageBitmap (يحترم اتجاه EXIF تلقائيًا)
+ * مع fallback لـ Image عند عدم الدعم.
+ */
+async function loadImageSource(file) {
+  if (typeof createImageBitmap === "function") {
+    try {
+      return await createImageBitmap(file, { imageOrientation: "from-image" });
+    } catch (err) {
+      console.warn("createImageBitmap فشل، سيتم استخدام الطريقة البديلة:", err);
+    }
+  }
+
+  return await new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.decoding = "async";
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      resolve(img);
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error("تعذّر قراءة الصورة. لو الصورة من آيفون بصيغة HEIC، غيّر إعداد الكاميرا إلى «الأكثر توافقًا» أو اختر صورة JPG."));
+    };
+    img.src = url;
+  });
+}
+
+function canvasToBlob(canvas, type, quality) {
+  return new Promise((resolve, reject) => {
+    if (canvas.toBlob) {
+      canvas.toBlob(
+        (blob) => (blob ? resolve(blob) : reject(new Error("فشل إنشاء ملف الصورة المضغوطة."))),
+        type,
+        quality
+      );
+      return;
+    }
+    // fallback للمتصفحات القديمة
+    try {
+      const dataUrl = canvas.toDataURL(type, quality);
+      const binary = atob(dataUrl.split(",")[1]);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      resolve(new Blob([bytes], { type }));
+    } catch (err) {
+      reject(err);
+    }
+  });
+}
+
+function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = String(reader.result || "");
+      const comma = result.indexOf(",");
+      comma >= 0 ? resolve(result.slice(comma + 1)) : reject(new Error("فشل تحويل الصورة."));
+    };
+    reader.onerror = () => reject(new Error("تعذّر قراءة الصورة المضغوطة."));
+    reader.readAsDataURL(blob);
+  });
+}
+
+function releaseCanvas(canvas) {
+  // مهم لتحرير الذاكرة على iOS
+  canvas.width = 0;
+  canvas.height = 0;
+}
+
+function safeFileName(originalName) {
+  const base = String(originalName || "receipt")
+    .replace(/\.[^/.]+$/, "")
+    .replace(/[^\w\u0600-\u06FF\s-]+/g, "_")
+    .trim()
+    .slice(0, 60);
+  return (base || "receipt") + ".jpg";
+}
+
+/**
+ * يضغط الصورة: يصغّر الأبعاد ثم يقلّل الجودة تدريجيًا،
+ * ولو لسه كبيرة يصغّر الأبعاد أكتر (حتى 4 جولات).
+ */
+async function compressReceiptImage(file) {
+  if (!file) return null;
+
+  if (file.size > RAW_FILE_MAX_BYTES) {
+    throw new Error(`حجم الصورة كبير جدًا (${formatBytes(file.size)}). الحد الأقصى ${formatBytes(RAW_FILE_MAX_BYTES)}.`);
+  }
+
+  const type = (file.type || "").toLowerCase();
+  if (type && !SUPPORTED_IMAGE_TYPES.includes(type)) {
+    if (type.includes("heic") || type.includes("heif")) {
+      throw new Error("صيغة HEIC غير مدعومة في المتصفح. من إعدادات الكاميرا في الآيفون اختر «الأكثر توافقًا» أو حوّل الصورة إلى JPG.");
+    }
+    throw new Error("الملف المختار ليس صورة مدعومة. اختر صورة JPG أو PNG.");
+  }
+
+  const source = await loadImageSource(file);
+  const srcW = source.width || source.naturalWidth;
+  const srcH = source.height || source.naturalHeight;
+
+  if (!srcW || !srcH) {
+    if (source.close) source.close();
+    throw new Error("تعذّر قراءة أبعاد الصورة. جرّب صورة أخرى.");
+  }
+
+  let maxDim = IMAGE_MAX_DIM;
+  let bestBlob = null;
+
   try {
-    const [
-      campaigns,
-      centers,
-      receiptTypes,
-      intentions,
-      volunteers,
-      donorCodes,
-    ] = await Promise.all([
-      fetchData("Campaigns"),
-      fetchData("Centers"),
-      fetchData("ReceiptTypes"),
-      fetchData("Intentions"),
-      fetchData("Volunteers"),
-      fetchData("donorCode"),
-    ]);
+    for (let round = 0; round < 4; round++) {
+      const scale = Math.min(1, maxDim / srcW, maxDim / srcH);
+      const w = Math.max(1, Math.round(srcW * scale));
+      const h = Math.max(1, Math.round(srcH * scale));
+
+      const canvas = document.createElement("canvas");
+      canvas.width = w;
+      canvas.height = h;
+
+      const ctx = canvas.getContext("2d", { alpha: false });
+      if (!ctx) {
+        releaseCanvas(canvas);
+        throw new Error("متصفحك لا يدعم معالجة الصور. جرّب Chrome أو Safari محدّث.");
+      }
+
+      // خلفية بيضاء: تمنع ظهور PNG الشفاف بخلفية سوداء بعد التحويل لـ JPEG
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, w, h);
+      ctx.imageSmoothingQuality = "high";
+      ctx.drawImage(source, 0, 0, w, h);
+
+      let quality = JPEG_START_QUALITY;
+      let blob = await canvasToBlob(canvas, "image/jpeg", quality);
+
+      while (blob.size > IMAGE_TARGET_BYTES && quality > JPEG_MIN_QUALITY) {
+        quality = Math.max(JPEG_MIN_QUALITY, quality - 0.1);
+        blob = await canvasToBlob(canvas, "image/jpeg", quality);
+      }
+
+      releaseCanvas(canvas);
+      bestBlob = blob;
+
+      if (blob.size <= IMAGE_TARGET_BYTES) break;
+      maxDim = Math.round(maxDim * 0.75); // جولة أخرى بأبعاد أصغر
+    }
+  } finally {
+    if (source.close) source.close();
+  }
+
+  if (!bestBlob) throw new Error("فشل ضغط صورة الإيصال.");
+
+  if (bestBlob.size > IMAGE_TARGET_BYTES * 1.6) {
+    throw new Error(`تعذّر ضغط الصورة لحجم مناسب (${formatBytes(bestBlob.size)}). جرّب تصوير الإيصال من مسافة أقرب أو بإضاءة أفضل.`);
+  }
+
+  const base64 = await blobToBase64(bestBlob);
+
+  return {
+    base64,
+    mimeType: "image/jpeg",
+    fileName: safeFileName(file.name),
+    size: bestBlob.size,
+    originalSize: file.size,
+    previewUrl: URL.createObjectURL(bestBlob),
+  };
+}
+
+// ============================================================
+//  تحميل البيانات
+// ============================================================
+
+async function fetchData(sheet) {
+  const url = `${WEB_APP_URL_GET}?sheet=${encodeURIComponent(sheet)}`;
+
+  for (let attempt = 1; attempt <= GET_MAX_ATTEMPTS; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), GET_TIMEOUT_MS);
+
+    try {
+      const response = await fetch(url, { signal: controller.signal });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const data = await response.json();
+      return Array.isArray(data) ? data : [];
+    } catch (err) {
+      console.error(`محاولة ${attempt} فشلت للورقة ${sheet}:`, err);
+      if (attempt === GET_MAX_ATTEMPTS) {
+        const isAbort = err.name === "AbortError";
+        throw new Error(
+          isAbort
+            ? `انتهت مهلة الاتصال عند تحميل «${sheet}»`
+            : `فشل تحميل «${sheet}»: ${err.message || err}`
+        );
+      }
+      await sleep(600 * Math.pow(2, attempt - 1));
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  return [];
+}
+
+async function loadAllData() {
+  const overlay = document.getElementById("loadingOverlay");
+
+  try {
+    const [campaigns, centers, receiptTypes, intentions, volunteers, donorCodes] =
+      await Promise.all([
+        fetchData("Campaigns"),
+        fetchData("Centers"),
+        fetchData("ReceiptTypes"),
+        fetchData("Intentions"),
+        fetchData("Volunteers"),
+        fetchData("donorCode"),
+      ]);
 
     allCampaigns = campaigns;
     allCenters = centers;
@@ -45,92 +284,52 @@ async function loadAllData() {
     populateSelect("center", allCenters);
 
     refreshAllLists();
+    checkCanAddEntry();
     updateSubmitButton();
-
-    // ===== إخفاء شاشة التحميل =====
-    const loadingOverlay = document.getElementById('loadingOverlay');
-    if (loadingOverlay) {
-      loadingOverlay.classList.add('hidden');
-    }
-
   } catch (error) {
     console.error("خطأ في تحميل البيانات:", error);
-    showError(
-      "فشل تحميل البيانات من Google Sheets. تأكد من اتصالك بالإنترنت وأن Web App منشور بشكل صحيح.",
-    );
-
-    const loadingOverlay = document.getElementById('loadingOverlay');
-    if (loadingOverlay) {
-      loadingOverlay.classList.add('hidden');
-    }
+    showError(`${error.message}. تأكد من الاتصال بالإنترنت ثم أعد تحميل الصفحة.`);
+  } finally {
+    if (overlay) overlay.classList.add("hidden");
   }
 }
 
-async function fetchData(sheet) {
-  // Fetch with retries and timeout to handle transient network errors
-  const url = `${WEB_APP_URL_GET}?sheet=${encodeURIComponent(sheet)}`;
-  const maxAttempts = 3;
-  const baseDelay = 600; // ms
-  const timeoutMs = 8000; // per-request timeout
-
-  const fetchWithTimeout = (resource, ms) => {
-    const controller = new AbortController();
-    const id = setTimeout(() => controller.abort(), ms);
-    return fetch(resource, { signal: controller.signal })
-      .finally(() => clearTimeout(id));
-  };
-
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    try {
-      const response = await fetchWithTimeout(url, timeoutMs);
-      if (!response.ok) {
-        const msg = `فشل تحميل ${sheet}: HTTP ${response.status}`;
-        console.warn(msg);
-        if (attempt === maxAttempts) {
-          showNotification('error', msg, 7000);
-          throw new Error(msg);
-        }
-        // otherwise retry
-      } else {
-        const data = await response.json();
-        return Array.isArray(data) ? data : [];
-      }
-    } catch (err) {
-      // handle AbortError differently
-      const isAbort = err.name === 'AbortError';
-      console.error(`Attempt ${attempt} failed for ${sheet}:`, err);
-      if (attempt === maxAttempts) {
-        const userMsg = isAbort
-          ? `انتهت مهلة الاتصال عند تحميل ${sheet} (timeout)`
-          : `فشل الاتصال أو حدث خطأ عند تحميل ${sheet}: ${err.message || err}`;
-        try { showNotification('error', userMsg, 8000); } catch (e) { console.error(e); }
-        return [];
-      }
-
-      // exponential backoff before next attempt
-      const delay = baseDelay * Math.pow(2, attempt - 1);
-      await new Promise((r) => setTimeout(r, delay));
-      // continue to next attempt
-    }
-  }
-  return [];
+function optionValueOf(item) {
+  if (item == null) return "";
+  if (typeof item === "string") return item;
+  return item.name || item.donorCode || item.id || "";
 }
 
 function populateSelect(selectId, data) {
   const select = document.getElementById(selectId);
   if (!select) return;
+  populateSelectForElement(select, data);
+}
 
-  select.innerHTML = `<option value="">اختر ${select.previousElementSibling ? select.previousElementSibling.textContent : ""}</option>`;
+function populateSelectForElement(select, data) {
+  if (!select) return;
+  const labelText = select.previousElementSibling ? select.previousElementSibling.textContent : "";
 
-  data.forEach((item) => {
+  select.innerHTML = "";
+  const placeholder = document.createElement("option");
+  placeholder.value = "";
+  placeholder.textContent = `اختر ${labelText}`.trim();
+  select.appendChild(placeholder);
+
+  (data || []).forEach((item) => {
+    const value = optionValueOf(item);
+    if (!value) return;
     const option = document.createElement("option");
-    option.value = item.name || item.id || item.donorCode || item;
-    option.textContent = item.name || item.donorCode || item;
+    option.value = value;
+    option.textContent = value;
     select.appendChild(option);
   });
 }
 
-// ====================== إدارة المتطوعين ======================
+// ============================================================
+//  القوائم المرتبطة
+// ============================================================
+
 function refreshAllLists() {
   const centerSelect = document.getElementById("center");
   const centerName = centerSelect ? centerSelect.value : "";
@@ -151,68 +350,58 @@ function refreshAllLists() {
       });
     }
 
-    const donorCodeDatalist = entry.querySelector(".donor-code-list");
-    if (donorCodeDatalist) {
-      donorCodeDatalist.innerHTML = "";
-      allDonorCodes.forEach((code) => {
-        const option = document.createElement("option");
-        option.value = code.donorCode || code.name || code;
-        option.textContent = code.donorCode || code.name || code;
-        donorCodeDatalist.appendChild(option);
-      });
-    }
+    fillDonorCodeList(entry.querySelector(".donor-code-list"));
   });
 }
 
-// ====================== مسح بيانات المتطوعين عند تغيير المركز ======================
+function fillDonorCodeList(datalist) {
+  if (!datalist) return;
+  datalist.innerHTML = "";
+  allDonorCodes.forEach((code) => {
+    const value = optionValueOf(code);
+    if (!value) return;
+    const option = document.createElement("option");
+    option.value = value;
+    datalist.appendChild(option);
+  });
+}
+
 function clearVolunteerData() {
   document.querySelectorAll(".entry-card").forEach((entry) => {
-    const volunteerNameInput = entry.querySelector(".volunteer-name");
-    const volunteerPhoneInput = entry.querySelector(".volunteer-phone");
-
-    if (volunteerNameInput) {
-      volunteerNameInput.value = "";
-    }
-    if (volunteerPhoneInput) {
-      volunteerPhoneInput.value = "";
-    }
+    const name = entry.querySelector(".volunteer-name");
+    const phone = entry.querySelector(".volunteer-phone");
+    if (name) name.value = "";
+    if (phone) phone.value = "";
   });
 }
 
-// ====================== التحقق من إمكانية إضافة تبرع ======================
 function checkCanAddEntry() {
   const campaign = document.getElementById("campaign");
   const center = document.getElementById("center");
   const addBtn = document.getElementById("addEntryBtn");
-
   if (!campaign || !center || !addBtn) return;
 
-  const hasCampaign = campaign.value && campaign.value !== "";
-  const hasCenter = center.value && center.value !== "";
-
-  if (hasCampaign && hasCenter) {
-    addBtn.disabled = false;
-    addBtn.title = "إضافة تبرع جديد";
-    addBtn.style.opacity = "1";
-    addBtn.style.cursor = "pointer";
-  } else {
-    addBtn.disabled = true;
-    addBtn.title = "يرجى اختيار اسم الحملة والمركز أولاً";
-    addBtn.style.opacity = "0.5";
-    addBtn.style.cursor = "not-allowed";
-  }
+  const ready = Boolean(campaign.value && center.value) && !isSubmitting;
+  addBtn.disabled = !ready;
+  addBtn.title = ready ? "إضافة تبرع جديد" : "يرجى اختيار اسم الحملة والمركز أولاً";
 }
 
-// ====================== إنشاء بطاقات التبرع ======================
+// ============================================================
+//  بطاقات التبرع
+// ============================================================
+
 function isValidOptionValue(inputEl, datalistEl) {
   if (!inputEl || !datalistEl) return false;
+  const typed = inputEl.value.trim();
+  if (!typed) return false;
+  return Array.from(datalistEl.options).some((o) => o.value.trim() === typed);
+}
 
-  const typedValue = inputEl.value.trim();
-  if (!typedValue) return false;
-
-  return Array.from(datalistEl.options).some(
-    (option) => option.value.trim() === typedValue,
-  );
+function renumberEntries() {
+  document.querySelectorAll(".entry-card").forEach((card, index) => {
+    const badge = card.querySelector(".entry-number");
+    if (badge) badge.textContent = `تبرع ${index + 1}`;
+  });
 }
 
 function createEntry() {
@@ -231,251 +420,325 @@ function createEntry() {
   const donorCodeListId = `donor-code-list-${entryCount}`;
 
   const entryHTML = `
-        <div class="entry-card" id="entry-${entryCount}">
-            <div class="entry-card-header">
-                <span class="entry-number">تبرع ${entryCount}</span>
-                <button type="button" class="btn-remove" onclick="removeEntry(${entryCount})">×</button>
-            </div>
-            
-            <div class="form-row">
-                <div class="form-group half">
-                    <label>اسم المتطوع</label>
-                    <input type="text" class="volunteer-name" list="${volunteerListId}" placeholder="بحث عن المتطوع" autocomplete="off" required>
-                    <datalist class="volunteer-list" id="${volunteerListId}"></datalist>
-                </div>
-                <div class="form-group half">
-                    <label>رقم الهاتف</label>
-                    <input type="tel" class="volunteer-phone" placeholder="010XXXXXXXX" inputmode="tel" pattern="[0-9]{10,}" required>
-                </div>
-            </div>
-            
-            <div class="form-row">
-                <div class="form-group half">
-                    <label>نوع الوصل</label>
-                    <select class="receipt-type" required>
-                        <option value="">اختر نوع الوصل</option>
-                    </select>
-                </div>
-                <div class="form-group half">
-                    <label>النية</label>
-                    <select class="intention" required>
-                        <option value="">اختر النية</option>
-                    </select>
-                </div>
-            </div>
-            
-            <div class="form-row">
-                <div class="form-group half">
-                    <label>المبلغ (ج.م)</label>
-                    <input type="number" class="amount" required min="1" placeholder="0">
-                </div>
-                <div class="form-group half">
-                    <label>الرقم المرجعي</label>
-                    <input type="text" class="ref-number" inputmode="text" placeholder="REF1234" required>
-                </div>
-            </div>
-            
-            <div class="form-row">
-                <div class="form-group half">
-                    <label>التاريخ</label>
-                    <input type="date" class="entry-date" value="${today}" required>
-                </div>
-                <div class="form-group half">
-                    <label>كود الحالة</label>
-                    <input type="text" class="donor-code" list="${donorCodeListId}" placeholder="اختر كود الحالة" autocomplete="off">
-                    <datalist class="donor-code-list" id="${donorCodeListId}"></datalist>
-                </div>
-            </div>
-            
-            <div class="form-group receipt-upload-group">
-                <label>صورة الإيصال</label>
-                <label class="receipt-upload-box">
-                  <input type="file" class="receipt-image" accept=".jpg,.jpeg,.png,image/jpeg,image/png" required>
-                    <span class="receipt-upload-text">اختر صورة</span>
-                </label>
-            </div>
+    <div class="entry-card" id="entry-${entryCount}" data-request-id="${uuid()}">
+      <div class="entry-card-header">
+        <span class="entry-number">تبرع ${entryCount}</span>
+        <button type="button" class="btn-remove" aria-label="حذف التبرع">×</button>
+      </div>
+
+      <div class="form-row">
+        <div class="form-group half">
+          <label>اسم المتطوع</label>
+          <input type="text" class="volunteer-name" list="${volunteerListId}" placeholder="بحث عن المتطوع" autocomplete="off">
+          <datalist class="volunteer-list" id="${volunteerListId}"></datalist>
         </div>
-    `;
+        <div class="form-group half">
+          <label>رقم الهاتف</label>
+          <input type="tel" class="volunteer-phone" placeholder="010XXXXXXXX" inputmode="numeric" maxlength="11">
+        </div>
+      </div>
+
+      <div class="form-row">
+        <div class="form-group half">
+          <label>نوع الوصل</label>
+          <select class="receipt-type"></select>
+        </div>
+        <div class="form-group half">
+          <label>النية</label>
+          <select class="intention"></select>
+        </div>
+      </div>
+
+      <div class="form-row">
+        <div class="form-group half">
+          <label>المبلغ (ج.م)</label>
+          <input type="number" class="amount" min="1" step="0.01" inputmode="decimal" placeholder="0">
+        </div>
+        <div class="form-group half">
+          <label>الرقم المرجعي</label>
+          <input type="text" class="ref-number" placeholder="REF1234" autocomplete="off">
+        </div>
+      </div>
+
+      <div class="form-row">
+        <div class="form-group half">
+          <label>التاريخ</label>
+          <input type="date" class="entry-date" value="${today}" max="${today}">
+        </div>
+        <div class="form-group half">
+          <label>كود الحالة</label>
+          <input type="text" class="donor-code" list="${donorCodeListId}" placeholder="اختر كود الحالة" autocomplete="off">
+          <datalist class="donor-code-list" id="${donorCodeListId}"></datalist>
+        </div>
+      </div>
+
+      <div class="form-group receipt-upload-group">
+        <label>صورة الإيصال</label>
+        <label class="receipt-upload-box">
+          <input type="file" class="receipt-image" accept="image/jpeg,image/png,image/webp">
+          <img class="receipt-preview" alt="" hidden>
+          <span class="receipt-upload-icon">📄</span>
+          <span class="receipt-upload-text">اختر صورة</span>
+          <span class="receipt-meta"></span>
+        </label>
+      </div>
+    </div>
+  `;
 
   container.insertAdjacentHTML("beforeend", entryHTML);
   const entryCard = container.lastElementChild;
 
-  const receiptSelect = entryCard.querySelector(".receipt-type");
-  const intentionSelect = entryCard.querySelector(".intention");
+  populateSelectForElement(entryCard.querySelector(".receipt-type"), allReceiptTypes);
+  populateSelectForElement(entryCard.querySelector(".intention"), allIntentions);
+  fillDonorCodeList(entryCard.querySelector(".donor-code-list"));
 
-  populateSelectForElement(receiptSelect, allReceiptTypes);
-  populateSelectForElement(intentionSelect, allIntentions);
+  entryCard.querySelector(".btn-remove").addEventListener("click", () => removeEntry(entryCard));
 
-  const donorCodeDatalist = entryCard.querySelector(".donor-code-list");
-  if (donorCodeDatalist) {
-    allDonorCodes.forEach((code) => {
-      const option = document.createElement("option");
-      option.value = code.donorCode || code.name || code;
-      option.textContent = code.donorCode || code.name || code;
-      donorCodeDatalist.appendChild(option);
-    });
-  }
+  wireVolunteerInput(entryCard);
+  wireReceiptInput(entryCard);
 
-  const donorCodeInput = entryCard.querySelector(".donor-code");
-  if (donorCodeInput && donorCodeDatalist) {
-    const updateDonorCodeSelection = () => {
-      if (donorCodeInput.value.trim()) {
-        donorCodeInput.setCustomValidity(
-          isValidOptionValue(donorCodeInput, donorCodeDatalist)
-            ? ""
-            : "يرجى اختيار كود الحالة من القائمة المقترحة",
-        );
-      } else {
-        donorCodeInput.setCustomValidity("");
-      }
-    };
+  refreshAllLists();
+  renumberEntries();
+  updateSubmitButton();
 
-    donorCodeInput.addEventListener("input", updateDonorCodeSelection);
-    donorCodeInput.addEventListener("change", updateDonorCodeSelection);
-    donorCodeInput.addEventListener("blur", updateDonorCodeSelection);
-  }
+  setTimeout(() => entryCard.scrollIntoView({ behavior: "smooth", block: "center" }), 100);
+}
 
-  const fileInput = entryCard.querySelector(".receipt-image");
-  const uploadText = entryCard.querySelector(".receipt-upload-text");
-  fileInput.addEventListener("change", () => {
-    if (fileInput.files && fileInput.files[0]) {
-      uploadText.textContent = fileInput.files[0].name;
-    }
-  });
-
+function wireVolunteerInput(entryCard) {
   const nameInput = entryCard.querySelector(".volunteer-name");
   const phoneInput = entryCard.querySelector(".volunteer-phone");
-  const volunteerDatalist = entryCard.querySelector(".volunteer-list");
+  const datalist = entryCard.querySelector(".volunteer-list");
 
-  const updateVolunteerSelection = () => {
-    const match = Array.from(volunteerDatalist.options).find(
-      (option) => option.value.trim() === nameInput.value.trim(),
+  const update = () => {
+    const match = Array.from(datalist.options).find(
+      (o) => o.value.trim() === nameInput.value.trim()
     );
-
     if (match) {
       phoneInput.value = match.dataset.phone || "";
-      nameInput.setCustomValidity("");
-    } else {
+      clearFieldError(nameInput);
+    } else if (nameInput.value.trim()) {
       phoneInput.value = "";
-      nameInput.setCustomValidity("يرجى اختيار اسم المتطوع من القائمة المقترحة");
     }
   };
 
-  nameInput.addEventListener("input", updateVolunteerSelection);
-  nameInput.addEventListener("change", updateVolunteerSelection);
-  nameInput.addEventListener("blur", updateVolunteerSelection);
+  nameInput.addEventListener("input", update);
+  nameInput.addEventListener("change", update);
+  nameInput.addEventListener("blur", update);
 
-  refreshAllLists();
-  updateSubmitButton();
-
-  setTimeout(() => {
-    entryCard.scrollIntoView({ behavior: 'smooth', block: 'center' });
-  }, 100);
-}
-
-function populateSelectForElement(select, data) {
-  select.innerHTML = `<option value="">اختر ${select.previousElementSibling ? select.previousElementSibling.textContent : ""}</option>`;
-
-  data.forEach((item) => {
-    const option = document.createElement("option");
-    option.value = item.name || item.id || item;
-    option.textContent = item.name || item;
-    select.appendChild(option);
+  phoneInput.addEventListener("input", () => {
+    phoneInput.value = phoneInput.value.replace(/\D/g, "").slice(0, 11);
+    clearFieldError(phoneInput);
   });
 }
 
-function removeEntry(id) {
-  document.getElementById(`entry-${id}`).remove();
+/**
+ * الضغط يحصل فور اختيار الصورة، مش وقت الإرسال.
+ * النتيجة بتتخزّن على العنصر نفسه في __receipt.
+ */
+function wireReceiptInput(entryCard) {
+  const fileInput = entryCard.querySelector(".receipt-image");
+  const textEl = entryCard.querySelector(".receipt-upload-text");
+  const metaEl = entryCard.querySelector(".receipt-meta");
+  const previewEl = entryCard.querySelector(".receipt-preview");
+
+  const resetPreview = () => {
+    if (fileInput.__receipt && fileInput.__receipt.previewUrl) {
+      URL.revokeObjectURL(fileInput.__receipt.previewUrl);
+    }
+    fileInput.__receipt = null;
+    previewEl.hidden = true;
+    previewEl.removeAttribute("src");
+    metaEl.textContent = "";
+  };
+
+  fileInput.addEventListener("change", async () => {
+    const file = fileInput.files && fileInput.files[0];
+    resetPreview();
+
+    if (!file) {
+      textEl.textContent = "اختر صورة";
+      updateSubmitButton();
+      return;
+    }
+
+    clearFieldError(fileInput);
+    entryCard.classList.add("is-compressing");
+    textEl.textContent = "جاري ضغط الصورة...";
+    metaEl.textContent = formatBytes(file.size);
+    pendingCompressions++;
+    updateSubmitButton();
+
+    try {
+      const result = await compressReceiptImage(file);
+      fileInput.__receipt = result;
+      textEl.textContent = result.fileName;
+      metaEl.textContent = `${formatBytes(result.originalSize)} ← ${formatBytes(result.size)}`;
+      previewEl.src = result.previewUrl;
+      previewEl.hidden = false;
+    } catch (error) {
+      console.error("خطأ في ضغط صورة الإيصال:", error);
+      fileInput.value = "";
+      textEl.textContent = "اختر صورة";
+      metaEl.textContent = "";
+      markFieldError(fileInput);
+      showNotification("error", error.message || "تعذّر تجهيز صورة الإيصال.", 7000);
+    } finally {
+      pendingCompressions = Math.max(0, pendingCompressions - 1);
+      entryCard.classList.remove("is-compressing");
+      updateSubmitButton();
+    }
+  });
+}
+
+function removeEntry(entryCard) {
+  if (isSubmitting) return;
+  const fileInput = entryCard.querySelector(".receipt-image");
+  if (fileInput && fileInput.__receipt && fileInput.__receipt.previewUrl) {
+    URL.revokeObjectURL(fileInput.__receipt.previewUrl);
+  }
+  entryCard.remove();
+  renumberEntries();
   updateSubmitButton();
 }
 
 function updateSubmitButton() {
-  const count = document.querySelectorAll(".entry-card").length;
+  const cards = document.querySelectorAll(".entry-card:not(.is-saved)");
   const btn = document.getElementById("submitBtn");
+  if (!btn) return;
   const text = btn.querySelector(".btn-text");
 
-  if (count === 0) {
+  if (isSubmitting) return;
+
+  if (pendingCompressions > 0) {
+    text.textContent = "جاري تجهيز الصور...";
+    btn.disabled = true;
+    return;
+  }
+
+  if (cards.length === 0) {
     text.textContent = "لا توجد تبرعات";
     btn.disabled = true;
   } else {
-    text.textContent = `تسجيل الكل (${count} تبرعات)`;
+    text.textContent = `تسجيل الكل (${cards.length})`;
     btn.disabled = false;
   }
 }
 
-// ====================== تحويل الصورة إلى Base64 ======================
-function fileToBase64(file) {
-  return new Promise((resolve, reject) => {
-    if (!file) {
-      resolve(null);
-      return;
-    }
+// ============================================================
+//  التحقق
+// ============================================================
 
-    if (!file.type || !file.type.startsWith("image/")) {
-      reject(new Error("الملف المختار ليس صورة مدعومة. اختر صورة JPG أو PNG."));
-      return;
-    }
-
-    const img = new Image();
-    const reader = new FileReader();
-
-    const finish = (dataUrl, width, height) => {
-      try {
-        const maxWidth = 1200;
-        const maxHeight = 1200;
-        const scale = Math.min(1, maxWidth / width, maxHeight / height);
-        const canvas = document.createElement("canvas");
-        const ctx = canvas.getContext("2d");
-
-        canvas.width = Math.max(1, Math.round(width * scale));
-        canvas.height = Math.max(1, Math.round(height * scale));
-
-        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-
-        const mimeType = "image/jpeg";
-        let quality = 0.85;
-        let compressedDataUrl = canvas.toDataURL(mimeType, quality);
-
-        while (compressedDataUrl.length * 0.75 > MAX_IMAGE_SIZE_BYTES && quality > 0.35) {
-          quality -= 0.1;
-          compressedDataUrl = canvas.toDataURL(mimeType, quality);
-        }
-
-        if (compressedDataUrl.length * 0.75 > MAX_IMAGE_SIZE_BYTES) {
-          throw new Error("تعذر ضغط صورة الإيصال إلى أقل من 1.5 ميجا بايت.");
-        }
-
-        resolve({
-          base64: compressedDataUrl.split(",")[1],
-          mimeType,
-          fileName: `${file.name.replace(/\.[^/.]+$/, "")}.jpg`,
-        });
-      } catch (error) {
-        reject(error);
-      }
-    };
-
-    img.onload = () => {
-      finish(reader.result, img.width, img.height);
-    };
-
-    img.onerror = () => {
-      reject(new Error("تعذّر قراءة الصورة. اختر صورة JPG أو PNG من معرض الهاتف."));
-    };
-
-    reader.onerror = () => reject(new Error("تعذّر قراءة ملف الصورة من الجهاز."));
-    reader.onload = () => {
-      img.src = reader.result;
-    };
-    reader.readAsDataURL(file);
-  });
+function markFieldError(field) {
+  if (field) field.classList.add("field-error");
+}
+function clearFieldError(field) {
+  if (field) field.classList.remove("field-error");
 }
 
+const EGYPT_PHONE_RE = /^01[0125][0-9]{8}$/;
+
+function validateEntry(entryCard, seenRefs) {
+  const errors = [];
+  const q = (sel) => entryCard.querySelector(sel);
+
+  const name = q(".volunteer-name");
+  const phone = q(".volunteer-phone");
+  const receiptType = q(".receipt-type");
+  const intention = q(".intention");
+  const amount = q(".amount");
+  const ref = q(".ref-number");
+  const date = q(".entry-date");
+  const donorCode = q(".donor-code");
+  const fileInput = q(".receipt-image");
+
+  [name, phone, receiptType, intention, amount, ref, date, donorCode, fileInput]
+    .forEach(clearFieldError);
+
+  if (!isValidOptionValue(name, entryCard.querySelector(".volunteer-list"))) {
+    markFieldError(name);
+    errors.push("اسم المتطوع يجب اختياره من القائمة");
+  }
+
+  if (!EGYPT_PHONE_RE.test(phone.value.trim())) {
+    markFieldError(phone);
+    errors.push("رقم الهاتف غير صحيح (11 رقم يبدأ بـ 010/011/012/015)");
+  }
+
+  if (!receiptType.value) { markFieldError(receiptType); errors.push("اختر نوع الوصل"); }
+  if (!intention.value) { markFieldError(intention); errors.push("اختر النية"); }
+
+  const amountValue = Number(amount.value);
+  if (!amount.value || !isFinite(amountValue) || amountValue <= 0) {
+    markFieldError(amount);
+    errors.push("المبلغ يجب أن يكون رقمًا أكبر من صفر");
+  }
+
+  const refValue = ref.value.trim();
+  if (!refValue) {
+    markFieldError(ref);
+    errors.push("الرقم المرجعي مطلوب");
+  } else if (seenRefs.has(refValue.toLowerCase())) {
+    markFieldError(ref);
+    errors.push(`الرقم المرجعي «${refValue}» مكرر`);
+  } else {
+    seenRefs.add(refValue.toLowerCase());
+  }
+
+  if (!date.value) {
+    markFieldError(date);
+    errors.push("التاريخ مطلوب");
+  } else if (date.value > new Date().toISOString().split("T")[0]) {
+    markFieldError(date);
+    errors.push("التاريخ لا يمكن أن يكون في المستقبل");
+  }
+
+  if (donorCode.value.trim() &&
+      !isValidOptionValue(donorCode, entryCard.querySelector(".donor-code-list"))) {
+    markFieldError(donorCode);
+    errors.push("كود الحالة يجب اختياره من القائمة");
+  }
+
+  if (!fileInput.__receipt) {
+    markFieldError(fileInput);
+    errors.push(
+      fileInput.files && fileInput.files[0]
+        ? "صورة الإيصال لم يكتمل تجهيزها، أعد اختيارها"
+        : "صورة الإيصال مطلوبة"
+    );
+  }
+
+  return errors;
+}
+
+function entryToPayload(entryCard) {
+  const q = (sel) => entryCard.querySelector(sel);
+  const receipt = q(".receipt-image").__receipt;
+
+  return {
+    requestId: entryCard.dataset.requestId,
+    volunteerName: q(".volunteer-name").value.trim(),
+    volunteerPhone: q(".volunteer-phone").value.trim(),
+    receiptType: q(".receipt-type").value,
+    intention: q(".intention").value,
+    amount: Number(q(".amount").value),
+    refNumber: q(".ref-number").value.trim(),
+    date: q(".entry-date").value,
+    donorCode: q(".donor-code").value.trim(),
+    receiptImageBase64: receipt ? receipt.base64 : null,
+    receiptImageName: receipt ? receipt.fileName : "",
+    receiptImageType: receipt ? receipt.mimeType : "",
+  };
+}
+
+// ============================================================
+//  الإرسال (تبرع تبرع، مع تتبّع المحفوظ)
+// ============================================================
+
 async function sendDonationPayload(payload) {
-  const formData = new URLSearchParams();
-  formData.append("campaign", payload.campaign);
-  formData.append("center", payload.center);
-  formData.append("entries", JSON.stringify(payload.entries));
+  const body = new URLSearchParams();
+  body.append("campaign", payload.campaign);
+  body.append("center", payload.center);
+  body.append("entries", JSON.stringify(payload.entries));
 
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), POST_TIMEOUT_MS);
@@ -483,24 +746,20 @@ async function sendDonationPayload(payload) {
   try {
     const response = await fetch(WEB_APP_URL_POST, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
-      },
-      body: formData.toString(),
+      headers: { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8" },
+      body: body.toString(),
       signal: controller.signal,
     });
 
     const responseText = await response.text();
-    let responseData;
+    let responseData = null;
     try {
       responseData = JSON.parse(responseText);
-    } catch {
-      responseData = null;
-    }
+    } catch (_) { /* رد نصّي */ }
 
-    const normalizedResponseText = responseText.trim().toLowerCase();
-    const isSuccessful = response.ok && (
-      normalizedResponseText === "success" ||
+    const normalized = responseText.trim().toLowerCase();
+    const ok = response.ok && (
+      normalized === "success" ||
       (responseData && (
         responseData.success === true ||
         responseData.success === "true" ||
@@ -508,18 +767,14 @@ async function sendDonationPayload(payload) {
       ))
     );
 
-    if (isSuccessful) {
-      // وحّد شكل الرد حتى لا تعتبر الواجهة رد "success" النصّي فشلًا.
-      return responseData && typeof responseData === "object"
-        ? { ...responseData, success: true }
-        : { success: true };
-    }
+    if (ok) return { success: true, data: responseData };
 
-    const errorMessage = responseData && (responseData.error || responseData.message);
-    throw new Error(errorMessage || `HTTP ${response.status}: ${responseText.slice(0, 200)}`);
+    const msg = (responseData && (responseData.error || responseData.message)) ||
+      `HTTP ${response.status}: ${responseText.slice(0, 150)}`;
+    throw new Error(msg);
   } catch (error) {
     if (error.name === "AbortError") {
-      throw new Error("انتهت مهلة الاتصال. قد يكون الطلب قيد الحفظ، لذلك لا تعاود الإرسال قبل مراجعة الشيت.");
+      throw new Error("انتهت مهلة الاتصال أثناء رفع هذا التبرع.");
     }
     throw error;
   } finally {
@@ -527,22 +782,42 @@ async function sendDonationPayload(payload) {
   }
 }
 
-// ====================== إرسال البيانات (إلى شيت 2) ======================
-document.getElementById("donationForm").addEventListener("submit", async (e) => {
-  e.preventDefault();
-
-  const errorBox = document.getElementById("errorMessage");
+function setSubmittingState(on) {
+  isSubmitting = on;
   const btn = document.getElementById("submitBtn");
   const loader = btn.querySelector(".btn-loader");
   const text = btn.querySelector(".btn-text");
   const addEntryBtn = document.getElementById("addEntryBtn");
   const form = document.getElementById("donationForm");
 
-  if (isSubmitting) {
+  btn.disabled = on;
+  if (on) {
+    btn.setAttribute("aria-busy", "true");
+    text.style.display = "none";
+    loader.style.display = "inline-flex";
+  } else {
+    btn.removeAttribute("aria-busy");
+    text.style.display = "inline";
+    loader.style.display = "none";
+  }
+
+  if (addEntryBtn) addEntryBtn.disabled = on;
+  if (form) form.classList.toggle("is-submitting", on);
+  if (!on) {
+    checkCanAddEntry();
+    updateSubmitButton();
+  }
+}
+
+async function handleSubmit(e) {
+  e.preventDefault();
+  if (isSubmitting) return;
+
+  if (pendingCompressions > 0) {
+    showError("انتظر حتى ينتهي تجهيز صور الإيصالات.");
     return;
   }
 
-  // التحقق من الحقول الأساسية
   const campaign = document.getElementById("campaign").value;
   const center = document.getElementById("center").value;
 
@@ -551,217 +826,175 @@ document.getElementById("donationForm").addEventListener("submit", async (e) => 
     return;
   }
 
-  const entryCards = document.querySelectorAll(".entry-card");
-  let hasMissingFields = false;
-
-  entryCards.forEach((entry) => {
-    const volunteerNameInput = entry.querySelector(".volunteer-name");
-    const volunteerDatalist = entry.querySelector(".volunteer-list");
-    const donorCodeInput = entry.querySelector(".donor-code");
-    const donorCodeDatalist = entry.querySelector(".donor-code-list");
-    const fields = [
-      volunteerNameInput,
-      entry.querySelector(".volunteer-phone"),
-      entry.querySelector(".receipt-type"),
-      entry.querySelector(".intention"),
-      entry.querySelector(".amount"),
-      entry.querySelector(".ref-number"),
-      entry.querySelector(".entry-date"),
-      entry.querySelector(".receipt-image"),
-    ];
-
-    fields.forEach((field) => {
-      if (field && !field.value) {
-        hasMissingFields = true;
-        field.style.borderColor = "red";
-      } else if (field) {
-        field.style.borderColor = "";
-      }
-    });
-
-    if (volunteerNameInput && volunteerDatalist && !isValidOptionValue(volunteerNameInput, volunteerDatalist)) {
-      hasMissingFields = true;
-      volunteerNameInput.style.borderColor = "red";
-    }
-
-    if (donorCodeInput && donorCodeDatalist && donorCodeInput.value.trim() && !isValidOptionValue(donorCodeInput, donorCodeDatalist)) {
-      hasMissingFields = true;
-      donorCodeInput.style.borderColor = "red";
-    }
-  });
-
-  if (hasMissingFields) {
-    showError("يرجى ملء جميع الحقول المطلوبة قبل تسجيل التبرعات");
+  const cards = Array.from(document.querySelectorAll(".entry-card:not(.is-saved)"));
+  if (cards.length === 0) {
+    showError("لا توجد تبرعات جديدة للتسجيل");
     return;
   }
 
-  errorBox.textContent = "";
-  errorBox.style.display = "none";
+  // تحقق شامل قبل أي إرسال
+  const seenRefs = new Set();
+  document.querySelectorAll(".entry-card.is-saved .ref-number").forEach((el) => {
+    seenRefs.add(el.value.trim().toLowerCase());
+  });
 
-  // تفعيل حالة التحميل
-  isSubmitting = true;
-  btn.disabled = true;
-  btn.setAttribute("aria-busy", "true");
-  text.style.display = "none";
-  loader.style.display = "inline-block";
+  const allErrors = [];
+  cards.forEach((card, i) => {
+    validateEntry(card, seenRefs).forEach((msg) => allErrors.push(`تبرع ${i + 1}: ${msg}`));
+  });
 
-  if (addEntryBtn) {
-    addEntryBtn.disabled = true;
-    addEntryBtn.style.opacity = "0.6";
-    addEntryBtn.style.cursor = "not-allowed";
+  if (allErrors.length) {
+    showError(allErrors.slice(0, 4).join(" • ") + (allErrors.length > 4 ? " …" : ""));
+    const firstBad = document.querySelector(".field-error");
+    if (firstBad) firstBad.scrollIntoView({ behavior: "smooth", block: "center" });
+    return;
   }
 
-  if (form) {
-    form.classList.add("is-submitting");
-  }
+  hideError();
+  setSubmittingState(true);
 
-  try {
-    // تجميع البيانات
-    const data = {
-      campaign: campaign,
-      center: center,
-      entries: [],
-    };
+  const loaderText = document.querySelector("#submitBtn .btn-loader");
+  let saved = 0;
+  const failures = [];
 
-    for (const entry of entryCards) {
-      const file = entry.querySelector(".receipt-image").files[0];
-      let compressedImage = null;
+  for (let i = 0; i < cards.length; i++) {
+    const card = cards[i];
+    if (loaderText) loaderText.textContent = `جاري الحفظ ${i + 1}/${cards.length}...`;
 
-      try {
-        compressedImage = file ? await fileToBase64(file) : null;
-      } catch (fileError) {
-        console.error("خطأ في صورة الإيصال:", fileError);
-        throw new Error(fileError.message || "حدث خطأ في صورة الإيصال");
-      }
-
-      data.entries.push({
-        volunteerName: entry.querySelector(".volunteer-name").value,
-        volunteerPhone: entry.querySelector(".volunteer-phone").value,
-        receiptType: entry.querySelector(".receipt-type").value,
-        intention: entry.querySelector(".intention").value,
-        amount: entry.querySelector(".amount").value,
-        refNumber: entry.querySelector(".ref-number").value,
-        date: entry.querySelector(".entry-date").value,
-        donorCode: entry.querySelector(".donor-code").value || "",
-        receiptImageBase64: compressedImage ? compressedImage.base64 : null,
-        receiptImageName: compressedImage ? compressedImage.fileName : "",
-        receiptImageType: compressedImage ? compressedImage.mimeType : "",
+    try {
+      await sendDonationPayload({
+        campaign,
+        center,
+        entries: [entryToPayload(card)],
       });
+      card.classList.add("is-saved");
+      card.querySelectorAll("input, select, button").forEach((el) => (el.disabled = true));
+      saved++;
+    } catch (error) {
+      console.error("فشل حفظ تبرع:", error);
+      card.classList.add("is-failed");
+      failures.push(`تبرع ${i + 1}: ${error.message}`);
     }
+  }
 
-    const responseData = await sendDonationPayload(data);
+  if (loaderText) loaderText.textContent = "جاري الحفظ...";
+  setSubmittingState(false);
 
-    if (responseData && responseData.success === true) {
-      document.getElementById("successOverlay").style.display = "flex";
-    } else {
-      const msg = (responseData && responseData.error) || "حدث خطأ أثناء الحفظ";
-      showError(`فشل حفظ البيانات: ${msg}`);
-    }
-  } catch (error) {
-    console.error("خطأ:", error);
-    const detail = error && error.message ? ` ${error.message}` : "";
+  if (failures.length === 0) {
+    const msgEl = document.getElementById("successMessage");
+    if (msgEl) msgEl.textContent = `تم حفظ ${saved} تبرع بنجاح`;
+    document.getElementById("successOverlay").style.display = "flex";
+  } else {
     showError(
-      `تعذر إرسال البيانات${detail}. حاول تقليل حجم الصورة أو إعادة المحاولة بعد قليل.`,
+      `تم حفظ ${saved} من ${cards.length}. التبرعات التي فشلت لا تزال موجودة ويمكن إعادة إرسالها. ${failures[0]}`
     );
+    showNotification("error", failures.join(" • "), 9000);
   }
+}
 
-  // إعادة تعيين حالة الزر
-  isSubmitting = false;
-  btn.disabled = false;
-  btn.removeAttribute("aria-busy");
-  text.style.display = "inline";
-  loader.style.display = "none";
+// ============================================================
+//  الإشعارات
+// ============================================================
 
-  if (addEntryBtn) {
-    addEntryBtn.disabled = false;
-    addEntryBtn.style.opacity = "1";
-    addEntryBtn.style.cursor = "pointer";
-  }
-
-  if (form) {
-    form.classList.remove("is-submitting");
-  }
-});
-
-// Global notification / toast helper
 function showNotification(type, message, duration = 4500) {
   const container = document.getElementById("toastContainer");
   if (!container) {
-    // fallback
-    console[type === 'error' ? 'error' : 'warn'](message);
+    console[type === "error" ? "error" : "warn"](message);
     return;
   }
 
   const toast = document.createElement("div");
-  toast.className = `toast toast--${type || 'info'}`;
+  toast.className = `toast toast--${type || "info"}`;
 
-  const icon = type === 'success' ? '✓' : type === 'error' ? '!' : type === 'warning' ? '!' : 'i';
-  toast.innerHTML = `
-    <div class="toast-icon">${icon}</div>
-    <div class="toast-body">${message}</div>
-    <button class="toast-close" aria-label="Close">×</button>
-  `;
+  const icon = document.createElement("div");
+  icon.className = "toast-icon";
+  icon.textContent = type === "success" ? "✓" : type === "info" ? "i" : "!";
 
+  const body = document.createElement("div");
+  body.className = "toast-body";
+  body.textContent = message; // textContent بدل innerHTML لمنع حقن HTML
+
+  const close = document.createElement("button");
+  close.type = "button";
+  close.className = "toast-close";
+  close.setAttribute("aria-label", "إغلاق");
+  close.textContent = "×";
+
+  toast.append(icon, body, close);
   container.appendChild(toast);
 
+  let hidden = false;
   const hide = () => {
-    toast.style.animation = 'toastOut 0.18s ease forwards';
-    setTimeout(() => {
-      if (toast && toast.parentNode) toast.parentNode.removeChild(toast);
-    }, 200);
+    if (hidden) return;
+    hidden = true;
+    toast.style.animation = "toastOut 0.18s ease forwards";
+    setTimeout(() => toast.remove(), 200);
   };
 
-  const closeBtn = toast.querySelector('.toast-close');
-  closeBtn.addEventListener('click', hide);
-
+  close.addEventListener("click", hide);
   setTimeout(hide, duration);
 }
 
-// Backwards-compatible showError using styled warning toast + inline error box
 function showError(message) {
   const errorBox = document.getElementById("errorMessage");
   if (errorBox) {
     errorBox.textContent = message;
     errorBox.style.display = "block";
   }
-  showNotification('warning', message, 5000);
+  showNotification("warning", message, 6000);
 }
 
-// ====================== إعادة التحميل ======================
-document.getElementById("newSubmission").addEventListener("click", () => {
-  location.reload();
-});
+function hideError() {
+  const errorBox = document.getElementById("errorMessage");
+  if (errorBox) {
+    errorBox.textContent = "";
+    errorBox.style.display = "none";
+  }
+}
 
-// ====================== التهيئة ======================
+// ============================================================
+//  التهيئة
+// ============================================================
+
 document.addEventListener("DOMContentLoaded", () => {
   if (location.protocol === "file:") {
-    showError("⚠️ يرجى فتح الصفحة عبر خادم محلي (http://localhost) وليس مباشرة من الملف.");
+    const overlay = document.getElementById("loadingOverlay");
+    if (overlay) overlay.classList.add("hidden");
+    showError("⚠️ يرجى فتح الصفحة عبر خادم (http/https) وليس مباشرة من الملف.");
     return;
   }
 
   const campaign = document.getElementById("campaign");
   const center = document.getElementById("center");
 
-  if (campaign) {
-    campaign.addEventListener("change", checkCanAddEntry);
-  }
+  if (campaign) campaign.addEventListener("change", checkCanAddEntry);
 
   if (center) {
-    center.addEventListener("change", function () {
-      // ===== مسح بيانات المتطوعين أولاً =====
+    center.addEventListener("change", () => {
       clearVolunteerData();
-      
-      // ===== ثم تحديث القوائم =====
       refreshAllLists();
       checkCanAddEntry();
     });
   }
 
   const addBtn = document.getElementById("addEntryBtn");
-  if (addBtn) {
-    addBtn.addEventListener("click", createEntry);
-  }
+  if (addBtn) addBtn.addEventListener("click", createEntry);
 
+  const form = document.getElementById("donationForm");
+  if (form) form.addEventListener("submit", handleSubmit);
+
+  const newBtn = document.getElementById("newSubmission");
+  if (newBtn) newBtn.addEventListener("click", () => location.reload());
+
+  // تحذير عند مغادرة الصفحة أثناء الحفظ
+  window.addEventListener("beforeunload", (e) => {
+    if (isSubmitting) {
+      e.preventDefault();
+      e.returnValue = "";
+    }
+  });
+
+  checkCanAddEntry();
+  updateSubmitButton();
   loadAllData();
-  setTimeout(checkCanAddEntry, 500);
 });
