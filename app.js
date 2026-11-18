@@ -1,7 +1,4 @@
-/* ============================================================
-   تسجيل التبرعات - نسخة مُحسّنة
-   التركيز: ضغط صورة الإيصال + إرسال آمن وغير مكرر
-   ============================================================ */
+
 
 // ====================== الإعدادات ======================
 const WEB_APP_URL_GET = "https://script.google.com/macros/s/AKfycbxmzqRPHjrvDYrClik3bn7OBI-saQvO8c4RtSZ6AZfeguTbUV57CPNaRE9rOrlpSMQj/exec";
@@ -16,6 +13,8 @@ const JPEG_MIN_QUALITY = 0.40;
 
 // الشبكة
 const POST_TIMEOUT_MS = 90000;
+const POST_MAX_ATTEMPTS = 4;      // محاولات الحفظ (كلها بنفس requestId، فلا يحدث تكرار)
+const STATUS_TIMEOUT_MS = 20000;  // مهلة سؤال السيرفر "هل اتحفظ؟"
 const GET_TIMEOUT_MS = 10000;
 const GET_MAX_ATTEMPTS = 3;
 
@@ -734,52 +733,142 @@ function entryToPayload(entryCard) {
 //  الإرسال (تبرع تبرع، مع تتبّع المحفوظ)
 // ============================================================
 
-async function sendDonationPayload(payload) {
+class SaveError extends Error {
+  constructor(message, { retryable = false, ambiguous = false } = {}) {
+    super(message);
+    this.name = "SaveError";
+    this.retryable = retryable; // هل تفيد إعادة المحاولة؟
+    this.ambiguous = ambiguous; // هل ممكن السيرفر يكون حفظ رغم فشل الرد؟
+  }
+}
+
+/** طلب POST واحد؛ يرجّع JSON أو يرمي SaveError (مع تحديد هل النتيجة غير معروفة). */
+async function postToServer(fields, timeoutMs) {
   const body = new URLSearchParams();
-  body.append("campaign", payload.campaign);
-  body.append("center", payload.center);
-  body.append("entries", JSON.stringify(payload.entries));
+  Object.entries(fields).forEach(([k, v]) => body.append(k, v));
 
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), POST_TIMEOUT_MS);
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
+  let response;
+  let responseText;
   try {
-    const response = await fetch(WEB_APP_URL_POST, {
+    response = await fetch(WEB_APP_URL_POST, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8" },
       body: body.toString(),
       signal: controller.signal,
     });
-
-    const responseText = await response.text();
-    let responseData = null;
-    try {
-      responseData = JSON.parse(responseText);
-    } catch (_) { /* رد نصّي */ }
-
-    const normalized = responseText.trim().toLowerCase();
-    const ok = response.ok && (
-      normalized === "success" ||
-      (responseData && (
-        responseData.success === true ||
-        responseData.success === "true" ||
-        String(responseData.status || "").toLowerCase() === "success"
-      ))
-    );
-
-    if (ok) return { success: true, data: responseData };
-
-    const msg = (responseData && (responseData.error || responseData.message)) ||
-      `HTTP ${response.status}: ${responseText.slice(0, 150)}`;
-    throw new Error(msg);
+    responseText = await response.text();
   } catch (error) {
-    if (error.name === "AbortError") {
-      throw new Error("انتهت مهلة الاتصال أثناء رفع هذا التبرع.");
-    }
-    throw error;
+    throw new SaveError(
+      error.name === "AbortError" ? "انتهت مهلة الاتصال" : "انقطع الاتصال بالشبكة",
+      { retryable: true, ambiguous: true }
+    );
   } finally {
     clearTimeout(timeoutId);
   }
+
+  let data = null;
+  try {
+    data = JSON.parse(responseText);
+  } catch (_) { /* رد غير JSON، مثل صفحة خطأ من Google */ }
+
+  if (!data || typeof data !== "object") {
+    throw new SaveError(`رد غير مفهوم من السيرفر (HTTP ${response.status})`, {
+      retryable: true,
+      ambiguous: true,
+    });
+  }
+  return data;
+}
+
+/** هل السيرفر أكّد حفظ كل requestId؟ (لا نعتمد على success وحدها) */
+function interpretServerReply(data, requestIds) {
+  const results = Array.isArray(data.results) ? data.results : null;
+  if (!results) {
+    return {
+      confirmed: false,
+      retryable: false,
+      message: "السيرفر لم يؤكد الحفظ. تأكد أن آخر نسخة من Apps Script منشورة (Deploy ← New version).",
+    };
+  }
+
+  const confirmedIds = new Set(
+    results
+      .filter((r) => r && (r.status === "saved" || r.status === "duplicate") && r.requestId)
+      .map((r) => r.requestId)
+  );
+  const allConfirmed = data.success === true && requestIds.every((id) => confirmedIds.has(id));
+  if (allConfirmed) return { confirmed: true };
+
+  const failed = results.find((r) => r && r.status === "error");
+  return {
+    confirmed: false,
+    retryable: data.retryable === true,
+    message: (failed && failed.error) || data.error || "السيرفر لم يؤكد حفظ التبرع",
+  };
+}
+
+/** نسأل السيرفر: هل التبرعات دي اتحفظت فعلًا؟ (true / false / null = مش معروف) */
+async function checkSavedOnServer(requestIds) {
+  try {
+    for (const id of requestIds) {
+      const data = await postToServer({ action: "status", requestId: id }, STATUS_TIMEOUT_MS);
+      if (data.success !== true) return null;
+      if (data.found !== true) return false;
+    }
+    return true;
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
+ * حفظ مضمون: لا يرجّع نجاح إلا بتأكيد صريح من السيرفر بأن السطر كُتب في الشيت.
+ * عند أي انقطاع نسأل السيرفر قبل إعادة المحاولة، وكل المحاولات بنفس requestId.
+ */
+async function sendDonationPayload(payload) {
+  const requestIds = payload.entries.map((e) => e.requestId);
+  const fields = {
+    campaign: payload.campaign,
+    center: payload.center,
+    entries: JSON.stringify(payload.entries),
+  };
+
+  let lastError = null;
+  let statusUnknown = false;
+
+  for (let attempt = 1; attempt <= POST_MAX_ATTEMPTS; attempt++) {
+    try {
+      const data = await postToServer(fields, POST_TIMEOUT_MS);
+      const verdict = interpretServerReply(data, requestIds);
+      if (verdict.confirmed) return { success: true, data };
+      lastError = new SaveError(verdict.message, { retryable: verdict.retryable });
+    } catch (err) {
+      if (!(err instanceof SaveError)) throw err;
+      lastError = err;
+    }
+
+    if (!lastError.retryable) break;
+
+    if (lastError.ambiguous) {
+      const saved = await checkSavedOnServer(requestIds);
+      if (saved === true) return { success: true, data: { recovered: true } };
+      statusUnknown = saved === null;
+    }
+
+    if (attempt < POST_MAX_ATTEMPTS) {
+      await sleep(800 * Math.pow(2, attempt - 1) + Math.random() * 400);
+    }
+  }
+
+  if (statusUnknown) {
+    throw new SaveError(
+      `${lastError.message}. لم نتمكن من التأكد هل اتحفظ. إعادة الإرسال آمنة ولن تسبب تكرارًا.`
+    );
+  }
+  throw lastError;
 }
 
 function setSubmittingState(on) {
@@ -861,6 +950,7 @@ async function handleSubmit(e) {
     const card = cards[i];
     if (loaderText) loaderText.textContent = `جاري الحفظ ${i + 1}/${cards.length}...`;
 
+    card.classList.remove("is-failed");
     try {
       await sendDonationPayload({
         campaign,
@@ -988,7 +1078,8 @@ document.addEventListener("DOMContentLoaded", () => {
 
   // تحذير عند مغادرة الصفحة أثناء الحفظ
   window.addEventListener("beforeunload", (e) => {
-    if (isSubmitting) {
+    // أثناء الحفظ، أو لو فيه تبرعات فشل حفظها وما زالت على الشاشة
+    if (isSubmitting || document.querySelector(".entry-card.is-failed")) {
       e.preventDefault();
       e.returnValue = "";
     }
