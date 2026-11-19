@@ -888,3 +888,29 @@ select::-ms-expand {
 .app-container {
   min-height: 0;
 }
+
+/* ===== استرجاع التبرعات غير المؤكدة (بعد Refresh) ===== */
+.recovery-banner {
+  margin: 12px 10px 0;
+  padding: 14px;
+  border-radius: 12px;
+  background: rgba(245, 158, 11, 0.14);
+  border: 1px solid rgba(251, 191, 36, 0.45);
+  color: #fde68a;
+  font-size: 14px;
+  line-height: 1.7;
+}
+.recovery-banner p { margin: 4px 0 8px; color: #fef3c7; }
+.recovery-banner ul { margin: 0 0 10px; padding-inline-start: 20px; color: #fef3c7; }
+.recovery-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.recovery-actions button {
+  border: none;
+  border-radius: 10px;
+  padding: 9px 14px;
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+}
+.recovery-retry { background: #1e88e5; color: #fff; }
+.recovery-discard { background: transparent; color: #fecaca; border: 1px solid rgba(248, 113, 113, 0.5) !important; }
+.recovery-actions button:disabled { opacity: 0.55; cursor: not-allowed; }

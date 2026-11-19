@@ -1,8 +1,11 @@
-
+/* ============================================================
+   تسجيل التبرعات - نسخة مُحسّنة
+   التركيز: ضغط صورة الإيصال + إرسال آمن وغير مكرر
+   ============================================================ */
 
 // ====================== الإعدادات ======================
 const WEB_APP_URL_GET = "https://script.google.com/macros/s/AKfycbxmzqRPHjrvDYrClik3bn7OBI-saQvO8c4RtSZ6AZfeguTbUV57CPNaRE9rOrlpSMQj/exec";
-const WEB_APP_URL_POST = "https://script.google.com/macros/s/AKfycbzVwUuZ2YSwBFz9C1OTIG4RhbqgWgjhNZP4JQPimiwtXaFi28rbzzSzdXqSat3BO-9X/exec";
+const WEB_APP_URL_POST = "https://script.google.com/macros/s/AKfycbyj2SZTlhqv8rQrqWHFA55oFCaClEho5UE_sD-5q-N8HNPrVoib9FTAMkAmF1VC-x0/exec";
 
 // حدود الصور
 const RAW_FILE_MAX_BYTES = 25 * 1024 * 1024; // أقصى حجم ملف خام مقبول قبل الضغط
@@ -730,6 +733,72 @@ function entryToPayload(entryCard) {
 }
 
 // ============================================================
+//  الحفظ المحلي (Outbox): أي تبرع بعد الضغط على «تسجيل» بيتخزّن في المتصفح
+//  ولا يُمسح إلا بعد تأكيد السيرفر. لو الصفحة اتقفلت أو عملت Refresh بيرجع.
+// ============================================================
+
+const OUTBOX_DB = "donations-outbox";
+const OUTBOX_STORE = "pending";
+let outboxDbPromise = null;
+
+function openOutbox() {
+  if (outboxDbPromise) return outboxDbPromise;
+  outboxDbPromise = new Promise((resolve) => {
+    try {
+      if (typeof indexedDB === "undefined") return resolve(null);
+      const req = indexedDB.open(OUTBOX_DB, 1);
+      req.onupgradeneeded = () => {
+        req.result.createObjectStore(OUTBOX_STORE, { keyPath: "requestId" });
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => resolve(null);
+      req.onblocked = () => resolve(null);
+    } catch (_) {
+      resolve(null);
+    }
+  });
+  return outboxDbPromise;
+}
+
+/** يشغّل عملية على المخزن ويرجّع النتيجة، أو null لو التخزين المحلي غير متاح (لا يرمي أبدًا). */
+function outboxTx(mode, work) {
+  return openOutbox().then(
+    (db) =>
+      new Promise((resolve) => {
+        if (!db) return resolve(null);
+        try {
+          const tx = db.transaction(OUTBOX_STORE, mode);
+          let result = true;
+          work(tx.objectStore(OUTBOX_STORE), (v) => { result = v; });
+          tx.oncomplete = () => resolve(result);
+          tx.onerror = () => resolve(null);
+          tx.onabort = () => resolve(null);
+        } catch (_) {
+          resolve(null);
+        }
+      })
+  );
+}
+
+const outboxPutMany = (items) => outboxTx("readwrite", (store) => items.forEach((it) => store.put(it)));
+const outboxDelete = (id) => outboxTx("readwrite", (store) => store.delete(id));
+const outboxClear = () => outboxTx("readwrite", (store) => store.clear());
+const outboxMarkFailed = (id, message) =>
+  outboxTx("readwrite", (store) => {
+    const g = store.get(id);
+    g.onsuccess = () => {
+      if (g.result) store.put({ ...g.result, lastError: String(message || "") });
+    };
+  });
+async function outboxAll() {
+  const list = await outboxTx("readonly", (store, set) => {
+    const r = store.getAll();
+    r.onsuccess = () => set(r.result || []);
+  });
+  return Array.isArray(list) ? list.sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0)) : [];
+}
+
+// ============================================================
 //  الإرسال (تبرع تبرع، مع تتبّع المحفوظ)
 // ============================================================
 
@@ -810,15 +879,22 @@ function interpretServerReply(data, requestIds) {
   };
 }
 
-/** نسأل السيرفر: هل التبرعات دي اتحفظت فعلًا؟ (true / false / null = مش معروف) */
+/** رقم الصف المؤكَّد لكل نتيجة من رد السيرفر */
+function rowsOf(data) {
+  return (Array.isArray(data && data.results) ? data.results : []).map((r) => r && r.row).filter(Boolean);
+}
+
+/** نسأل السيرفر: هل التبرعات دي اتحفظت فعلًا؟ (مصفوفة أرقام الصفوف = اتحفظت / false = لا / null = مش معروف) */
 async function checkSavedOnServer(requestIds) {
+  const rows = [];
   try {
     for (const id of requestIds) {
       const data = await postToServer({ action: "status", requestId: id }, STATUS_TIMEOUT_MS);
       if (data.success !== true) return null;
       if (data.found !== true) return false;
+      rows.push(data.row);
     }
-    return true;
+    return rows;
   } catch (_) {
     return null;
   }
@@ -828,11 +904,12 @@ async function checkSavedOnServer(requestIds) {
  * حفظ مضمون: لا يرجّع نجاح إلا بتأكيد صريح من السيرفر بأن السطر كُتب في الشيت.
  * عند أي انقطاع نسأل السيرفر قبل إعادة المحاولة، وكل المحاولات بنفس requestId.
  */
-async function sendDonationPayload(payload) {
+async function sendDonationPayload(payload, onRetry) {
   const requestIds = payload.entries.map((e) => e.requestId);
   const fields = {
     campaign: payload.campaign,
     center: payload.center,
+    batchId: payload.batchId || "",
     entries: JSON.stringify(payload.entries),
   };
 
@@ -840,10 +917,11 @@ async function sendDonationPayload(payload) {
   let statusUnknown = false;
 
   for (let attempt = 1; attempt <= POST_MAX_ATTEMPTS; attempt++) {
+    if (attempt > 1 && typeof onRetry === "function") onRetry(attempt);
     try {
       const data = await postToServer(fields, POST_TIMEOUT_MS);
       const verdict = interpretServerReply(data, requestIds);
-      if (verdict.confirmed) return { success: true, data };
+      if (verdict.confirmed) return { success: true, data, rows: rowsOf(data) };
       lastError = new SaveError(verdict.message, { retryable: verdict.retryable });
     } catch (err) {
       if (!(err instanceof SaveError)) throw err;
@@ -854,7 +932,7 @@ async function sendDonationPayload(payload) {
 
     if (lastError.ambiguous) {
       const saved = await checkSavedOnServer(requestIds);
-      if (saved === true) return { success: true, data: { recovered: true } };
+      if (Array.isArray(saved)) return { success: true, data: { recovered: true }, rows: saved.filter(Boolean) };
       statusUnknown = saved === null;
     }
 
@@ -942,8 +1020,19 @@ async function handleSubmit(e) {
   hideError();
   setSubmittingState(true);
 
+  // رقم عملية التسجيل + تخزين محلي لكل تبرع قبل أول إرسال (يُمسح بعد تأكيد السيرفر فقط)
+  const batchId = uuid();
+  const payloads = cards.map(entryToPayload);
+  await outboxPutMany(
+    payloads.map((entry) => ({
+      requestId: entry.requestId, campaign, center, batchId, entry,
+      createdAt: Date.now(), lastError: "",
+    }))
+  );
+
   const loaderText = document.querySelector("#submitBtn .btn-loader");
   let saved = 0;
+  const savedRows = [];
   const failures = [];
 
   for (let i = 0; i < cards.length; i++) {
@@ -952,16 +1041,20 @@ async function handleSubmit(e) {
 
     card.classList.remove("is-failed");
     try {
-      await sendDonationPayload({
-        campaign,
-        center,
-        entries: [entryToPayload(card)],
-      });
+      const result = await sendDonationPayload(
+        { campaign, center, batchId, entries: [payloads[i]] },
+        (n) => {
+          if (loaderText) loaderText.textContent = `إعادة المحاولة ${n}/${POST_MAX_ATTEMPTS} (تبرع ${i + 1}/${cards.length})...`;
+        }
+      );
+      await outboxDelete(payloads[i].requestId);
       card.classList.add("is-saved");
       card.querySelectorAll("input, select, button").forEach((el) => (el.disabled = true));
       saved++;
+      savedRows.push(...(result.rows || []));
     } catch (error) {
       console.error("فشل حفظ تبرع:", error);
+      await outboxMarkFailed(payloads[i].requestId, error.message);
       card.classList.add("is-failed");
       failures.push(`تبرع ${i + 1}: ${error.message}`);
     }
@@ -972,14 +1065,115 @@ async function handleSubmit(e) {
 
   if (failures.length === 0) {
     const msgEl = document.getElementById("successMessage");
-    if (msgEl) msgEl.textContent = `تم حفظ ${saved} تبرع بنجاح`;
+    if (msgEl) {
+      msgEl.textContent =
+        `تم حفظ ${saved} تبرع بنجاح` +
+        (savedRows.length ? ` (تأكيد الشيت: صف ${savedRows.join("، ")})` : "");
+    }
     document.getElementById("successOverlay").style.display = "flex";
   } else {
     showError(
-      `تم حفظ ${saved} من ${cards.length}. التبرعات التي فشلت لا تزال موجودة ويمكن إعادة إرسالها. ${failures[0]}`
+      `تم حفظ ${saved} من ${cards.length}. التبرعات التي فشلت لا تزال موجودة ويمكن إعادة إرسالها، وهي محفوظة أيضًا في جهازك. ${failures[0]}`
     );
     showNotification("error", failures.join(" • "), 9000);
   }
+}
+
+// ============================================================
+//  استرجاع التبرعات اللي لم يتأكد حفظها (بعد Refresh أو قفل الصفحة)
+// ============================================================
+
+async function showRecoveryBanner() {
+  const old = document.getElementById("recoveryBanner");
+  if (old) old.remove();
+
+  const items = await outboxAll();
+  if (!items.length) return;
+
+  const form = document.getElementById("donationForm");
+  if (!form || !form.parentNode) return;
+
+  const box = document.createElement("div");
+  box.id = "recoveryBanner";
+  box.className = "recovery-banner";
+
+  const title = document.createElement("strong");
+  title.textContent = `⚠️ فيه ${items.length} تبرع لم يتأكد حفظه في الشيت (محفوظ في جهازك)`;
+  const hint = document.createElement("p");
+  hint.textContent = "أعد الإرسال من هنا قبل ما تسجلهم من جديد، عشان ما يتكرروش.";
+
+  const list = document.createElement("ul");
+  items.forEach((it) => {
+    const e = it.entry || {};
+    const li = document.createElement("li");
+    li.textContent = `${e.volunteerName || "—"} • ${e.amount || 0} ج.م • مرجع ${e.refNumber || "—"}`;
+    list.appendChild(li);
+  });
+
+  const actions = document.createElement("div");
+  actions.className = "recovery-actions";
+  const retryBtn = document.createElement("button");
+  retryBtn.type = "button";
+  retryBtn.className = "recovery-retry";
+  retryBtn.textContent = "إعادة الإرسال الآن";
+  const dropBtn = document.createElement("button");
+  dropBtn.type = "button";
+  dropBtn.className = "recovery-discard";
+  dropBtn.textContent = "حذف المحفوظ";
+  actions.append(retryBtn, dropBtn);
+
+  box.append(title, hint, list, actions);
+  form.parentNode.insertBefore(box, form);
+
+  retryBtn.addEventListener("click", () => retryOutbox(items, retryBtn, dropBtn));
+  dropBtn.addEventListener("click", async () => {
+    if (!window.confirm("هتحذف التبرعات المحفوظة في الجهاز نهائيًا من غير ما تتسجل. متأكد؟")) return;
+    await outboxClear();
+    showRecoveryBanner();
+  });
+}
+
+async function retryOutbox(items, retryBtn, dropBtn) {
+  if (isSubmitting) return;
+  retryBtn.disabled = true;
+  dropBtn.disabled = true;
+  setSubmittingState(true);
+
+  const loaderText = document.querySelector("#submitBtn .btn-loader");
+  let ok = 0;
+  const rows = [];
+  const failures = [];
+
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i];
+    if (loaderText) loaderText.textContent = `استرجاع ${i + 1}/${items.length}...`;
+    try {
+      const result = await sendDonationPayload({
+        campaign: it.campaign, center: it.center, batchId: it.batchId, entries: [it.entry],
+      });
+      await outboxDelete(it.requestId);
+      ok++;
+      rows.push(...(result.rows || []));
+    } catch (error) {
+      await outboxMarkFailed(it.requestId, error.message);
+      failures.push(error.message);
+    }
+  }
+
+  if (loaderText) loaderText.textContent = "جاري الحفظ...";
+  setSubmittingState(false);
+
+  if (ok) {
+    showNotification(
+      "success",
+      `تم تأكيد حفظ ${ok} تبرع` + (rows.length ? ` (صف ${rows.join("، ")})` : ""),
+      7000
+    );
+  }
+  if (failures.length) {
+    showNotification("error", `${failures.length} تبرع لم يُحفظ بعد: ${failures[0]}`, 9000);
+  }
+  await showRecoveryBanner();
 }
 
 // ============================================================
@@ -1087,5 +1281,6 @@ document.addEventListener("DOMContentLoaded", () => {
 
   checkCanAddEntry();
   updateSubmitButton();
+  showRecoveryBanner();
   loadAllData();
 });
