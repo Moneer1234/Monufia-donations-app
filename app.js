@@ -5,7 +5,7 @@
 
 // ====================== الإعدادات ======================
 const WEB_APP_URL_GET = "https://script.google.com/macros/s/AKfycbxmzqRPHjrvDYrClik3bn7OBI-saQvO8c4RtSZ6AZfeguTbUV57CPNaRE9rOrlpSMQj/exec";
-const WEB_APP_URL_POST = "https://script.google.com/macros/s/AKfycbyj2SZTlhqv8rQrqWHFA55oFCaClEho5UE_sD-5q-N8HNPrVoib9FTAMkAmF1VC-x0/exec";
+const WEB_APP_URL_POST = "https://script.google.com/macros/s/AKfycbxB_iXsvsbw1pnfgFvIH6YdITpNpFvCfoeOMuIsQDg2fmhIYu3R_Iv04PajfPn_JWg0/exec";
 
 // حدود الصور
 const RAW_FILE_MAX_BYTES = 25 * 1024 * 1024; // أقصى حجم ملف خام مقبول قبل الضغط
@@ -19,6 +19,7 @@ const POST_TIMEOUT_MS = 90000;
 const POST_MAX_ATTEMPTS = 4;      // محاولات الحفظ (كلها بنفس requestId، فلا يحدث تكرار)
 const STATUS_TIMEOUT_MS = 20000;  // مهلة سؤال السيرفر "هل اتحفظ؟"
 const GET_TIMEOUT_MS = 10000;
+const OUTBOX_TIMEOUT_MS = 2500;   // التخزين المحلي لا يجوز أبدًا أن يعطّل الإرسال
 const GET_MAX_ATTEMPTS = 3;
 
 // أنواع الصور المدعومة
@@ -34,6 +35,7 @@ let allCenters = [];
 let allDonorCodes = [];
 let isSubmitting = false;
 let pendingCompressions = 0;
+let serverOutdated = false;   // نسخة Apps Script المنشورة قديمة (لا تؤكد الحفظ ولا تمنع التكرار)
 
 // ============================================================
 //  أدوات مساعدة
@@ -611,6 +613,12 @@ function updateSubmitButton() {
 
   if (isSubmitting) return;
 
+  if (serverOutdated) {
+    text.textContent = "التسجيل متوقف: السيرفر يحتاج تحديث";
+    btn.disabled = true;
+    return;
+  }
+
   if (pendingCompressions > 0) {
     text.textContent = "جاري تجهيز الصور...";
     btn.disabled = true;
@@ -753,6 +761,7 @@ function openOutbox() {
       req.onsuccess = () => resolve(req.result);
       req.onerror = () => resolve(null);
       req.onblocked = () => resolve(null);
+      setTimeout(() => resolve(null), OUTBOX_TIMEOUT_MS); // بعض المتصفحات بتعلّق بدون رد
     } catch (_) {
       resolve(null);
     }
@@ -766,6 +775,7 @@ function outboxTx(mode, work) {
     (db) =>
       new Promise((resolve) => {
         if (!db) return resolve(null);
+        setTimeout(() => resolve(null), OUTBOX_TIMEOUT_MS);
         try {
           const tx = db.transaction(OUTBOX_STORE, mode);
           let result = true;
@@ -980,6 +990,11 @@ async function handleSubmit(e) {
   e.preventDefault();
   if (isSubmitting) return;
 
+  if (serverOutdated) {
+    showError(SERVER_OUTDATED_MSG);
+    return;
+  }
+
   if (pendingCompressions > 0) {
     showError("انتظر حتى ينتهي تجهيز صور الإيصالات.");
     return;
@@ -1135,6 +1150,10 @@ async function showRecoveryBanner() {
 
 async function retryOutbox(items, retryBtn, dropBtn) {
   if (isSubmitting) return;
+  if (serverOutdated) {
+    showError(SERVER_OUTDATED_MSG);
+    return;
+  }
   retryBtn.disabled = true;
   dropBtn.disabled = true;
   setSubmittingState(true);
@@ -1174,6 +1193,37 @@ async function retryOutbox(items, retryBtn, dropBtn) {
     showNotification("error", `${failures.length} تبرع لم يُحفظ بعد: ${failures[0]}`, 9000);
   }
   await showRecoveryBanner();
+}
+
+// ============================================================
+//  التأكد من نسخة السيرفر المنشورة
+//  السيرفر القديم بيكتب الصف لكن مش بيأكد ولا بيمنع التكرار، فلو اشتغلنا معاه
+//  كل إعادة محاولة هتكرر التبرع. لذلك لو النسخة قديمة بنوقف التسجيل ونقول السبب.
+// ============================================================
+
+const SERVER_OUTDATED_MSG =
+  "⚠️ نسخة Apps Script المنشورة قديمة، فتم إيقاف التسجيل لحماية البيانات من التكرار. " +
+  "انشر الكود الجديد: Deploy ← Manage deployments ← Edit ← Version: New version ← Deploy، ثم أعد تحميل الصفحة.";
+
+async function checkServerVersion() {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), GET_TIMEOUT_MS);
+  try {
+    const response = await fetch(`${WEB_APP_URL_POST}?action=ping`, { signal: controller.signal });
+    const data = await response.json();
+    // رد JSON سليم لكن بدون رقم نسخة = كود قديم. أي مشكلة تانية (شبكة/صفحة غريبة) لا نوقف بسببها.
+    if (data && typeof data === "object" && !data.version) {
+      serverOutdated = true;
+      showError(SERVER_OUTDATED_MSG);
+      updateSubmitButton();
+      const bar = document.getElementById("errorMessage");
+      if (bar) bar.style.display = "block";
+    }
+  } catch (_) {
+    /* بنكمّل: كل حفظ بيتأكد من رد السيرفر على أي حال */
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 // ============================================================
@@ -1283,4 +1333,5 @@ document.addEventListener("DOMContentLoaded", () => {
   updateSubmitButton();
   showRecoveryBanner();
   loadAllData();
+  checkServerVersion();
 });
