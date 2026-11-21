@@ -5,7 +5,7 @@
 
 // ====================== الإعدادات ======================
 const WEB_APP_URL_GET = "https://script.google.com/macros/s/AKfycbxmzqRPHjrvDYrClik3bn7OBI-saQvO8c4RtSZ6AZfeguTbUV57CPNaRE9rOrlpSMQj/exec";
-const WEB_APP_URL_POST = "https://script.google.com/macros/s/AKfycbxB_iXsvsbw1pnfgFvIH6YdITpNpFvCfoeOMuIsQDg2fmhIYu3R_Iv04PajfPn_JWg0/exec";
+const WEB_APP_URL_POST = "https://script.google.com/macros/s/AKfycbxCnqorxTZ0UJ7cSf4IDwwNi4vlC2q3YKGcW0dXEdKK-76oasJY6cB8yEjpYy6fuSEX/exec";
 
 // حدود الصور
 const RAW_FILE_MAX_BYTES = 25 * 1024 * 1024; // أقصى حجم ملف خام مقبول قبل الضغط
